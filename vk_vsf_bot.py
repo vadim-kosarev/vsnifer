@@ -6,8 +6,10 @@ downloading, and managing video posts.
 """
 
 import asyncio
+import json
 import logging
 import os
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -23,19 +25,22 @@ from telethon.tl.types import Message
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logs_dir: Path = Path("logs")
-logs_dir.mkdir(exist_ok=True)
+# Configure logging — log file named after the script: logs/<script_name>.log
+_log_level: int = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+_logs_dir: Path = Path("logs")
+_logs_dir.mkdir(exist_ok=True)
+_log_file: Path = _logs_dir / f"{Path(__file__).stem}.log"
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(logs_dir / "bot.log"),
+        logging.FileHandler(_log_file),
         logging.StreamHandler(),
     ],
 )
 logger: logging.Logger = logging.getLogger(__name__)
+logger.debug(f"Logging level: {logging.getLevelName(_log_level)}, log file: {_log_file}")
 
 
 class TelegramCredentials(BaseModel):
@@ -145,6 +150,7 @@ async def get_credentials() -> TelegramCredentials:
         raise ValueError(f"Invalid API_ID format. Must be a number, got: {api_id}") from e
 
 
+
 async def fetch_recent_posts(
     channel_id: str, count: int = 10
 ) -> list[ChannelPost]:
@@ -190,8 +196,11 @@ async def fetch_recent_posts(
         logger.info(f"Authenticated, fetching recent {count} posts from channel: {channel_id}")
 
         async def _collect_posts() -> list[ChannelPost]:
+            # Resolve channel entity (uses cache if available)
+            _work_dir = Path(os.getenv("WORK_DIR", "H:\\TEMP\\vk_vsf"))
+            channel = await resolve_channel(client, channel_id, _work_dir / channel_to_folder_name(channel_id))
             result: list[ChannelPost] = []
-            async for message in client.iter_messages(channel_id, limit=count):
+            async for message in client.iter_messages(channel, limit=count):
                 post: ChannelPost = ChannelPost(
                     post_id=message.id,
                     text=message.text,
@@ -251,6 +260,7 @@ async def cmd_view_recent(args: argparse.Namespace) -> None:
         args: Parsed command arguments.
     """
     channel_id: str = args.channel or os.getenv("TARGET_CHANNEL", "+otRtx2aMM0ZlMTVi")
+    channel_id = normalize_channel_id(channel_id)
     count: int = args.count
 
     try:
@@ -273,6 +283,204 @@ async def cmd_view_recent(args: argparse.Namespace) -> None:
         raise
 
 
+async def _human_delay(short: bool = False) -> None:
+    """
+    Sleep for a random human-like interval.
+
+    short=True  →  0.3–1.2s  (between reading posts)
+    short=False →  1.5–4.5s  (after downloading media)
+    """
+    delay: float = random.uniform(0.3, 1.2) if short else random.uniform(1.5, 4.5)
+    logger.debug(f"Sleeping {delay:.1f}s (human delay)")
+    await asyncio.sleep(delay)
+
+
+def normalize_channel_id(channel_id: str) -> str:
+    """
+    Normalize channel identifier — only adds '@' for bare usernames.
+
+    Leaves untouched:
+      - https://t.me/... URLs
+      - @username
+      - +<invite_hash>
+      - numeric IDs
+    """
+    channel_id = channel_id.strip()
+    if (
+        channel_id.startswith("http")      # full URL
+        or channel_id.startswith("@")      # already @username
+        or channel_id.startswith("+")      # private invite hash
+        or channel_id.lstrip("-").isdigit()  # numeric ID
+    ):
+        return channel_id
+    return f"@{channel_id}"
+
+
+def channel_to_folder_name(channel_id: str) -> str:
+    """Convert any channel identifier to a safe folder name."""
+    name: str = channel_id
+    # Strip URL prefix: https://t.me/ or t.me/
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    # Strip leading punctuation
+    name = name.lstrip("@").lstrip("+")
+    # Replace characters unsafe for folder names
+    for ch in r'\/:*?"<>|':
+        name = name.replace(ch, "_")
+    return name or "unknown_channel"
+
+
+async def resolve_channel(client: TelegramClient, channel_id: str, channel_dir: Path):
+    """
+    Resolve channel_id to a Telethon entity, caching the numeric ID.
+
+    On first call: calls get_entity(channel_id), saves entity.id to
+    channel_dir/channel_id.txt so future calls use the stable numeric ID directly.
+
+    Returns the resolved entity object.
+    """
+    cache_file: Path = channel_dir / "channel_id.txt"
+
+    if cache_file.exists():
+        cached_id: int = int(cache_file.read_text(encoding="utf-8").strip())
+        logger.debug(f"Using cached channel ID: {cached_id}")
+        entity = await client.get_entity(cached_id)
+    else:
+        logger.info(f"Resolving channel: {channel_id}")
+        entity = await client.get_entity(channel_id)
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(str(entity.id), encoding="utf-8")
+        logger.info(f"Resolved channel ID: {entity.id} → cached to {cache_file}")
+
+    return entity
+
+
+async def download_channel_posts(
+    client: TelegramClient,
+    channel_id: str,
+    count: int,
+    work_dir: Path,
+) -> None:
+    """
+    Download recent posts from a channel into work/<channel>/<post_id>/.
+
+    Each post folder contains:
+      meta.json       — post metadata (id, date, media type, views, forwards)
+      text.txt        — post text (if any)
+      channel_id.txt  — cached numeric channel ID (channel root folder)
+      <media>         — photo/video/document files (if any)
+    """
+    channel_dir: Path = work_dir / channel_to_folder_name(channel_id)
+    channel_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve once → get stable entity, cache numeric ID
+    channel = await resolve_channel(client, channel_id, channel_dir)
+    logger.info(f"Saving posts to: {channel_dir}")
+
+    downloaded: int = 0
+    skipped: int = 0
+
+    async for message in client.iter_messages(channel, limit=count):
+        post_dir: Path = channel_dir / str(message.id)
+
+        # Skip already downloaded posts
+        if (post_dir / "meta.json").exists():
+            logger.debug(f"Post {message.id} already downloaded, skipping")
+            skipped += 1
+            continue
+
+        post_dir.mkdir(exist_ok=True)
+
+        # Save metadata
+        meta: dict = {
+            "post_id": message.id,
+            "date": message.date.isoformat() if message.date else None,
+            "has_media": message.media is not None,
+            "media_type": type(message.media).__name__ if message.media else None,
+            "views": getattr(message, "views", None),
+            "forwards": getattr(message, "forwards", None),
+        }
+        (post_dir / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # Save text
+        if message.text:
+            (post_dir / "text.txt").write_text(message.text, encoding="utf-8")
+
+        # Download media
+        if message.media:
+            try:
+                media_path: Optional[Path] = await client.download_media(
+                    message, file=str(post_dir) + "/"
+                )
+                if media_path:
+                    logger.info(f"Post {message.id}: saved media → {Path(media_path).name}")
+                else:
+                    logger.warning(f"Post {message.id}: media download returned None")
+            except Exception as e:
+                logger.error(f"Post {message.id}: media download failed: {e}")
+            # Longer pause after media download
+            await _human_delay(short=False)
+        else:
+            logger.info(f"Post {message.id}: text only")
+            # Short pause between posts
+            await _human_delay(short=True)
+
+        downloaded += 1
+
+    logger.info(f"Done: {downloaded} downloaded, {skipped} already existed")
+
+
+async def cmd_download(args: argparse.Namespace) -> None:
+    """
+    Handle 'download' command — fetch posts with media into work/<channel>/.
+    """
+    channel_id: str = args.channel or os.getenv("TARGET_CHANNEL", "")
+    channel_id = normalize_channel_id(channel_id)
+    count: int = args.count
+    work_dir: Path = Path(args.work_dir)
+
+    if not channel_id:
+        logger.error("Channel not specified. Use --channel or set TARGET_CHANNEL in .env")
+        raise ValueError("Channel not specified")
+
+    logger.info(f"Downloading {count} posts from {channel_id} → work/{channel_to_folder_name(channel_id)}/")
+
+    try:
+        credentials: TelegramCredentials = await get_credentials()
+    except ValueError as e:
+        logger.error(f"Credential error: {e}")
+        raise
+
+    client: TelegramClient = TelegramClient(
+        "vsnifer_session",
+        credentials.api_id,
+        credentials.api_hash,
+        **build_client_kwargs(),
+    )
+
+    try:
+        if credentials.phone:
+            await asyncio.wait_for(client.start(phone=credentials.phone), timeout=120)
+        else:
+            await asyncio.wait_for(
+                client.start(bot_token=credentials.bot_token), timeout=30
+            )
+
+        await asyncio.wait_for(
+            download_channel_posts(client, channel_id, count, work_dir),
+            timeout=3600,  # 1 hour max for large downloads
+        )
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        raise
+    finally:
+        await client.disconnect()
+
+
 async def main() -> None:
     """Main entry point for the bot."""
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
@@ -280,11 +488,10 @@ async def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python vk_vsf_bot.py
-  python vk_vsf_bot.py --help
   python vk_vsf_bot.py view-recent
-  python vk_vsf_bot.py view-recent --count 20
-  python vk_vsf_bot.py view-recent --channel "+otRtx2aMM0ZlMTVi" --count 5
+  python vk_vsf_bot.py view-recent --channel @babazoyka --count 20
+  python vk_vsf_bot.py download
+  python vk_vsf_bot.py download --channel @babazoyka --count 50
         """,
     )
 
@@ -308,6 +515,31 @@ Examples:
         help="Number of recent posts to fetch (default: 10)",
     )
     view_recent_parser.set_defaults(func=cmd_view_recent)
+
+    # download command
+    download_parser = subparsers.add_parser(
+        "download",
+        help="Download recent posts with media into work/<channel>/",
+    )
+    download_parser.add_argument(
+        "--channel",
+        type=str,
+        default=os.getenv("TARGET_CHANNEL", ""),
+        help="Channel ID or username (default from .env)",
+    )
+    download_parser.add_argument(
+        "--count",
+        type=int,
+        default=int(os.getenv("RECENT_POSTS_COUNT", "10")),
+        help="Number of recent posts to download (default: 10)",
+    )
+    download_parser.add_argument(
+        "--work-dir",
+        type=str,
+        default=os.getenv("WORK_DIR", r"work"),
+        help=r"Directory to save downloaded posts (default from .env: H:\TEMP\vk_vsf)",
+    )
+    download_parser.set_defaults(func=cmd_download)
 
     args: argparse.Namespace = parser.parse_args()
 

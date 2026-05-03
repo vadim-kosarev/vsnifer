@@ -120,3 +120,6 @@ yarn-error.log
 *.swp
 *.tmp
 
+work/
+
+vsnifer_session.session
