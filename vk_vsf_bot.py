@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Optional
 
 import argparse
+import socks
+import TelethonFakeTLS
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from telethon import TelegramClient
+from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.tl.types import Message
 
 # Load environment variables
@@ -40,7 +43,8 @@ class TelegramCredentials(BaseModel):
 
     api_id: int
     api_hash: str
-    bot_token: str
+    phone: Optional[str] = None  # User account phone (international format, e.g. +79001234567)
+    bot_token: Optional[str] = None  # Bot token (alternative to phone auth)
 
     class Config:
         """Pydantic config."""
@@ -63,6 +67,47 @@ class ChannelPost(BaseModel):
         extra = "forbid"
 
 
+def build_client_kwargs() -> dict:
+    """
+    Build TelegramClient extra kwargs (proxy / connection) from environment variables.
+
+    Supported PROXY_TYPE values: socks5, socks4, mtproto.
+    Returns empty dict if PROXY_TYPE is not set.
+    """
+    proxy_type: Optional[str] = os.getenv("PROXY_TYPE", "").lower().strip()
+    if not proxy_type:
+        return {}
+
+    proxy_host: Optional[str] = os.getenv("PROXY_HOST")
+    proxy_port_str: Optional[str] = os.getenv("PROXY_PORT")
+
+    if not proxy_host or not proxy_port_str:
+        raise ValueError("PROXY_HOST and PROXY_PORT must be set when PROXY_TYPE is defined")
+
+    proxy_port: int = int(proxy_port_str)
+
+    if proxy_type == "socks5":
+        return {"proxy": (socks.SOCKS5, proxy_host, proxy_port)}
+    elif proxy_type == "socks4":
+        return {"proxy": (socks.SOCKS4, proxy_host, proxy_port)}
+    elif proxy_type == "mtproto":
+        proxy_secret: str = os.getenv("PROXY_SECRET", "")
+        # ee-prefix = FakeTLS: TelethonFakeTLS prepends 'ee' itself, so strip it before passing
+        # dd-prefix or plain = randomized intermediate
+        if proxy_secret.lower().startswith("ee"):
+            secret_for_faketls: str = proxy_secret[2:]  # strip 'ee' — library adds it back internally
+            return {
+                "connection": TelethonFakeTLS.ConnectionTcpMTProxyFakeTLS,
+                "proxy": (proxy_host, proxy_port, secret_for_faketls),
+            }
+        return {
+            "connection": ConnectionTcpMTProxyRandomizedIntermediate,
+            "proxy": (proxy_host, proxy_port, proxy_secret),
+        }
+    else:
+        raise ValueError(f"Unsupported PROXY_TYPE: '{proxy_type}'. Use: socks5, socks4, mtproto")
+
+
 async def get_credentials() -> TelegramCredentials:
     """
     Load Telegram credentials from environment variables.
@@ -76,9 +121,13 @@ async def get_credentials() -> TelegramCredentials:
     api_id: Optional[str] = os.getenv("API_ID")
     api_hash: Optional[str] = os.getenv("API_HASH")
     bot_token: Optional[str] = os.getenv("BOT_TOKEN")
+    phone: Optional[str] = os.getenv("PHONE")
 
-    if not all([api_id, api_hash, bot_token]):
-        raise ValueError("Missing required environment variables: API_ID, API_HASH, BOT_TOKEN")
+    if not all([api_id, api_hash]):
+        raise ValueError("Missing required environment variables: API_ID, API_HASH")
+
+    if not phone and not bot_token:
+        raise ValueError("Missing auth method: set PHONE (user session) or BOT_TOKEN in .env")
 
     # Check for placeholder values
     placeholder_values: set[str] = {"YOUR_API_ID", "YOUR_API_HASH", "your_api_id_here", "your_api_hash_here"}
@@ -89,6 +138,7 @@ async def get_credentials() -> TelegramCredentials:
         return TelegramCredentials(
             api_id=int(api_id),
             api_hash=api_hash,
+            phone=phone,
             bot_token=bot_token,
         )
     except ValueError as e:
@@ -118,25 +168,42 @@ async def fetch_recent_posts(
         "vsnifer_session",
         credentials.api_id,
         credentials.api_hash,
+        **build_client_kwargs(),
     )
 
     posts: list[ChannelPost] = []
 
     try:
-        # Connect only for fetching (don't start as bot)
-        await client.connect()
-        logger.info(f"Fetching recent {count} posts from channel: {channel_id}")
-
-        async for message in client.iter_messages(channel_id, limit=count):
-            post: ChannelPost = ChannelPost(
-                post_id=message.id,
-                text=message.text,
-                has_media=message.media is not None,
-                media_type=type(message.media).__name__ if message.media else None,
-                date=message.date.isoformat() if message.date else "Unknown",
+        # Prefer user session (phone) over bot token — bots can't read arbitrary channels
+        if credentials.phone:
+            logger.info("Using user session auth (phone)")
+            await asyncio.wait_for(
+                client.start(phone=credentials.phone),
+                timeout=120,  # Extra time for manual code entry on first run
             )
-            posts.append(post)
-            logger.debug(f"Fetched post {post.post_id}: {post.text[:50] if post.text else 'No text'}...")
+        else:
+            logger.info("Using bot token auth")
+            await asyncio.wait_for(
+                client.start(bot_token=credentials.bot_token),
+                timeout=30,
+            )
+        logger.info(f"Authenticated, fetching recent {count} posts from channel: {channel_id}")
+
+        async def _collect_posts() -> list[ChannelPost]:
+            result: list[ChannelPost] = []
+            async for message in client.iter_messages(channel_id, limit=count):
+                post: ChannelPost = ChannelPost(
+                    post_id=message.id,
+                    text=message.text,
+                    has_media=message.media is not None,
+                    media_type=type(message.media).__name__ if message.media else None,
+                    date=message.date.isoformat() if message.date else "Unknown",
+                )
+                result.append(post)
+                logger.debug(f"Fetched post {post.post_id}: {post.text[:50] if post.text else 'No text'}...")
+            return result
+
+        posts = await asyncio.wait_for(_collect_posts(), timeout=60)
 
         logger.info(f"Successfully fetched {len(posts)} posts")
 
