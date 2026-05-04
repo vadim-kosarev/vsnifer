@@ -65,6 +65,41 @@ class AppConfig(BaseModel):
     proxy_switch_max_drops: int = 3
     # Rolling window duration in seconds.
     proxy_switch_window_secs: float = 300.0
+    # Ad / spam filter rules.
+    ad_filter: "AdFilterConfig" = None  # type: ignore[assignment]
+
+    model_config = {"extra": "allow"}
+
+    def model_post_init(self, __context) -> None:  # noqa: ANN001
+        if self.ad_filter is None:
+            object.__setattr__(self, "ad_filter", AdFilterConfig())
+
+
+class AdFilterConfig(BaseModel):
+    """
+    Configuration for the ad/spam filter applied in join_video.py.
+
+    All text lists are case-insensitive.  An empty list or zero value disables
+    the corresponding rule group.
+
+    Fields:
+      ban_text_contains    — ban if post text contains any of these substrings.
+      ban_text_regex       — ban if post text matches any of these regexes.
+      ban_channel_mentions — ban if post text mentions any of these @channels
+                             or t.me/<channel> links.
+      ban_min_views        — ban posts with fewer views than this value (0 = off).
+      ban_min_duration_sec — ban clips shorter than this many seconds (0 = off).
+      ban_max_duration_sec — ban clips longer than this many seconds (0 = off).
+      ban_max_file_size_mb — ban clips larger than this many megabytes (0 = off).
+    """
+
+    ban_text_contains: list[str] = []
+    ban_text_regex: list[str] = []
+    ban_channel_mentions: list[str] = []
+    ban_min_views: int = 0
+    ban_min_duration_sec: float = 0.0
+    ban_max_duration_sec: float = 0.0
+    ban_max_file_size_mb: float = 0.0
 
     model_config = {"extra": "allow"}
 

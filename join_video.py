@@ -1,7 +1,7 @@
 """
 join_video.py — concatenate all video files from a work directory into one Full HD file.
 
-Scans work_dir for video files (sorted by post date from meta.json),
+Scans work_dir for video files (sorted by post date or interest score from meta.json),
 probes each file with ffprobe, then encodes to 1920x1080 H.264/AAC using the
 ffmpeg concat filter (NOT the concat demuxer).
 
@@ -12,23 +12,35 @@ Why concat filter instead of concat demuxer:
   The concat filter processes each input independently, resets all timestamps, and
   properly handles missing audio streams (replaced with generated silence).
 
+Interest scoring (--sort interest-asc / interest-desc):
+  Raw score = (reactions * w_r + forwards * w_f + replies * w_rep) / max(views, 1)
+  Dividing by views normalises for channel audience size, so videos from small
+  channels can outrank videos from large channels if they drove higher engagement.
+  Scores are then globally min-max normalised to the [0, 1] range.
+  Weights are read from .env: INTEREST_W_REACTIONS, INTEREST_W_FORWARDS,
+  INTEREST_W_REPLIES (defaults: 10, 5, 2).
+
 Usage:
     python join_video.py --output result.mp4
     python join_video.py --work-dir H:\\TEMP\\vk_vsf\\babazoyka --output babazoyka_full.mp4
+    python join_video.py --output result.mp4 --sort interest-asc
 """
 
 import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
+
+from config import AdFilterConfig, load_app_config
 
 load_dotenv()
 
@@ -61,8 +73,33 @@ class VideoInfo(BaseModel):
 
     path: Path
     has_audio: bool
-    duration: float  # seconds; used to generate silence for audio-less clips
-    chapter_title: str = ""  # human-readable chapter name for the output file
+    duration: float       # seconds; used to generate silence for audio-less clips
+    chapter_title: str = ""    # human-readable chapter name for the output file
+    interest_score: float = 0.0  # globally normalised engagement score [0, 1]
+
+
+class InterestWeights(BaseModel):
+    """
+    Weights for computing the raw engagement rate from post metadata.
+
+    Read from .env variables:
+      INTEREST_W_REACTIONS (default 10)
+      INTEREST_W_FORWARDS  (default 5)
+      INTEREST_W_REPLIES   (default 2)
+    """
+
+    reactions: float = 10.0
+    forwards: float = 5.0
+    replies: float = 2.0
+
+
+def load_interest_weights() -> InterestWeights:
+    """Load InterestWeights from environment variables."""
+    return InterestWeights(
+        reactions=float(os.getenv("INTEREST_W_REACTIONS", "10")),
+        forwards=float(os.getenv("INTEREST_W_FORWARDS", "5")),
+        replies=float(os.getenv("INTEREST_W_REPLIES", "2")),
+    )
 
 
 def find_ffmpeg() -> Path:
@@ -238,6 +275,450 @@ def filter_videos_by_date(
             continue
         result.append(video)
     return result
+
+
+def _compute_raw_interest(meta: dict, weights: InterestWeights) -> float:
+    """
+    Compute the raw engagement rate for a single post.
+
+    Formula:
+        (reactions * w_r + forwards * w_f + replies * w_rep) / max(views, 1)
+
+    Dividing all engagement signals by views removes the dependency on the
+    channel's absolute audience size, making scores comparable across channels
+    of very different popularity.
+    """
+    views: int = max(meta.get("views") or 0, 1)
+    reactions: int = meta.get("reactions_total") or 0
+    forwards: int = meta.get("forwards") or 0
+    replies: int = meta.get("replies") or 0
+    return (
+        reactions * weights.reactions
+        + forwards * weights.forwards
+        + replies * weights.replies
+    ) / views
+
+
+def compute_interest_scores(
+    videos: list[Path],
+    weights: InterestWeights,
+) -> dict[Path, float]:
+    """
+    Compute normalised interest scores in [0, 1] for every video in the list.
+
+    Steps:
+      1. Read meta.json from each video's post directory.
+      2. Compute raw engagement rate (weighted signals / views).
+      3. Apply global min-max normalisation so the most engaging video gets 1.0
+         and the least engaging gets 0.0.
+
+    Videos whose meta.json is missing or unreadable receive a raw score of 0.0.
+    When all raw scores are identical (including all-zero), every video is
+    assigned 0.5 so the sort order is stable but semantically neutral.
+    """
+    raw: dict[Path, float] = {}
+    for video in videos:
+        meta_file: Path = video.parent / "meta.json"
+        try:
+            meta: dict = json.loads(meta_file.read_text(encoding="utf-8"))
+            raw[video] = _compute_raw_interest(meta, weights)
+        except Exception as exc:
+            logger.debug(f"No interest score for {video.name}: {exc}")
+            raw[video] = 0.0
+
+    values: list[float] = list(raw.values())
+    min_v: float = min(values) if values else 0.0
+    max_v: float = max(values) if values else 0.0
+    span: float = max_v - min_v
+
+    if span == 0.0:
+        return {v: 0.5 for v in videos}
+
+    return {v: (s - min_v) / span for v, s in raw.items()}
+
+
+# ---------------------------------------------------------------------------
+# Ad / spam filter
+# ---------------------------------------------------------------------------
+
+# A BanRule receives the full PostContext and returns:
+#   None        — post passes (not banned by this rule)
+#   str         — post is banned; the string is the human-readable reason
+BanRule = Callable[["PostContext"], Optional[str]]
+
+
+class PostContext(BaseModel):
+    """
+    All available data about a single post, passed to every BanRule.
+
+    Loaded from the post directory that contains the video:
+      meta.json    → views, reactions, forwards, replies, date, media_type …
+      text.txt     → full post text (empty string when absent)
+      stat()       → file_size_bytes (always available)
+      ffprobe      → duration_seconds (populated when ffprobe is passed to
+                     _load_post_context; None otherwise)
+    The channel name is derived from the path relative to work_dir.
+    """
+
+    video_path: Path
+    post_dir: Path
+    channel_name: str             # folder name, e.g. "babazoyka"
+    post_id: Optional[int] = None
+    text: str = ""                # full post text; empty when no text.txt
+    date: Optional[datetime] = None
+    views: Optional[int] = None
+    forwards: Optional[int] = None
+    replies: Optional[int] = None
+    reactions_total: Optional[int] = None
+    reactions: Optional[dict[str, int]] = None
+    has_media: bool = False
+    media_type: Optional[str] = None
+    # Media properties
+    file_size_bytes: Optional[int] = None   # from stat(), always filled
+    duration_seconds: Optional[float] = None  # from ffprobe, None if not probed
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    @property
+    def file_size_mb(self) -> Optional[float]:
+        """File size in megabytes, or None when unavailable."""
+        return self.file_size_bytes / (1024 * 1024) if self.file_size_bytes is not None else None
+
+
+def _load_post_context(
+    video_path: Path,
+    work_dir: Path,
+    ffprobe: Optional[Path] = None,
+) -> PostContext:
+    """
+    Build a PostContext for video_path by reading meta.json and text.txt
+    from the post directory.  Missing files are silently ignored.
+
+    When ffprobe is provided, a lightweight format-level probe is performed
+    to populate duration_seconds (~0.05 s per file).
+    file_size_bytes is always populated from the filesystem stat.
+    """
+    post_dir: Path = video_path.parent
+
+    # Derive channel name from relative path depth
+    try:
+        rel_parts = video_path.relative_to(work_dir).parts
+        # work_dir/channel/post_id/video  → rel_parts[0] is channel
+        # work_dir/post_id/video          → use work_dir name as channel
+        channel_name = rel_parts[0] if len(rel_parts) >= 3 else work_dir.name
+    except ValueError:
+        channel_name = post_dir.parent.name
+
+    meta: dict = {}
+    try:
+        meta = json.loads((post_dir / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    text: str = ""
+    try:
+        text = (post_dir / "text.txt").read_text(encoding="utf-8")
+    except Exception:
+        pass
+
+    post_date: Optional[datetime] = None
+    date_str: str = meta.get("date", "")
+    if date_str:
+        try:
+            post_date = datetime.fromisoformat(date_str)
+        except Exception:
+            pass
+
+    # File size — always available from the filesystem
+    file_size_bytes: Optional[int] = None
+    try:
+        file_size_bytes = video_path.stat().st_size
+    except Exception:
+        pass
+
+    # Duration — lightweight ffprobe format probe (no stream decoding)
+    duration_seconds: Optional[float] = None
+    if ffprobe is not None:
+        try:
+            cmd: list[str] = [
+                str(ffprobe), "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                str(video_path),
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=15
+            )
+            if result.returncode == 0:
+                fmt: dict = json.loads(result.stdout).get("format", {})
+                if fmt.get("duration"):
+                    duration_seconds = float(fmt["duration"])
+        except Exception as exc:
+            logger.debug(f"ffprobe duration probe failed for {video_path.name}: {exc}")
+
+    return PostContext(
+        video_path=video_path,
+        post_dir=post_dir,
+        channel_name=channel_name,
+        post_id=meta.get("post_id"),
+        text=text,
+        date=post_date,
+        views=meta.get("views"),
+        forwards=meta.get("forwards"),
+        replies=meta.get("replies"),
+        reactions_total=meta.get("reactions_total"),
+        reactions=meta.get("reactions"),
+        has_media=meta.get("has_media", False),
+        media_type=meta.get("media_type"),
+        file_size_bytes=file_size_bytes,
+        duration_seconds=duration_seconds,
+    )
+
+
+def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
+    """
+    Build the active list of ban rules from AdFilterConfig (loaded from .env.json).
+
+    Each rule is a callable (PostContext) -> Optional[str]:
+      returns None   → video passes this rule
+      returns str    → video is banned; the string is logged as the reason
+
+    -----------------------------------------------------------------------
+    Config-driven rules are built from cfg (ad_filter section in .env.json).
+    Custom code-level rules can be appended at the bottom of this function
+    without touching .env.json.
+    -----------------------------------------------------------------------
+    """
+    rules: list[BanRule] = []
+
+    # ------------------------------------------------------------------
+    # Rule: text contains banned substrings (case-insensitive)
+    # .env.json → ad_filter.ban_text_contains
+    # ------------------------------------------------------------------
+    if cfg.ban_text_contains:
+        _patterns: list[str] = [p.lower() for p in cfg.ban_text_contains]
+
+        def _rule_text_contains(
+            ctx: PostContext, patterns: list[str] = _patterns
+        ) -> Optional[str]:
+            text_lower = ctx.text.lower()
+            for p in patterns:
+                if p in text_lower:
+                    return f"text contains {p!r}"
+            return None
+
+        rules.append(_rule_text_contains)
+
+    # ------------------------------------------------------------------
+    # Rule: text matches banned regular expressions (case-insensitive)
+    # .env.json → ad_filter.ban_text_regex
+    # ------------------------------------------------------------------
+    if cfg.ban_text_regex:
+        _compiled: list[tuple[str, re.Pattern]] = [
+            (p, re.compile(p, re.IGNORECASE | re.DOTALL))
+            for p in cfg.ban_text_regex
+        ]
+
+        def _rule_text_regex(
+            ctx: PostContext, compiled: list[tuple[str, re.Pattern]] = _compiled
+        ) -> Optional[str]:
+            for pattern_str, rx in compiled:
+                if rx.search(ctx.text):
+                    return f"text matches regex {pattern_str!r}"
+            return None
+
+        rules.append(_rule_text_regex)
+
+    # ------------------------------------------------------------------
+    # Rule: text mentions a banned channel (@name or t.me/name)
+    # .env.json → ad_filter.ban_channel_mentions
+    # ------------------------------------------------------------------
+    if cfg.ban_channel_mentions:
+        _channels: list[str] = [c.lower().lstrip("@") for c in cfg.ban_channel_mentions]
+
+        def _rule_channel_mention(
+            ctx: PostContext, channels: list[str] = _channels
+        ) -> Optional[str]:
+            text_lower = ctx.text.lower()
+            for ch in channels:
+                if f"@{ch}" in text_lower or f"t.me/{ch}" in text_lower:
+                    return f"text mentions banned channel @{ch}"
+            return None
+
+        rules.append(_rule_channel_mention)
+
+    # ------------------------------------------------------------------
+    # Rule: post has fewer views than the minimum threshold
+    # .env.json → ad_filter.ban_min_views  (0 = disabled)
+    # ------------------------------------------------------------------
+    if cfg.ban_min_views and cfg.ban_min_views > 0:
+        _min_views: int = cfg.ban_min_views
+
+        def _rule_min_views(
+            ctx: PostContext, min_v: int = _min_views
+        ) -> Optional[str]:
+            if ctx.views is not None and ctx.views < min_v:
+                return f"views {ctx.views} < minimum {min_v}"
+            return None
+
+        rules.append(_rule_min_views)
+
+    # ------------------------------------------------------------------
+    # Rule: clip is shorter than the minimum duration
+    # .env.json → ad_filter.ban_min_duration_sec  (0 = disabled)
+    # Requires ffprobe to be passed to filter_videos_by_rules.
+    # ------------------------------------------------------------------
+    if cfg.ban_min_duration_sec and cfg.ban_min_duration_sec > 0:
+        _min_dur: float = cfg.ban_min_duration_sec
+
+        def _rule_min_duration(
+            ctx: PostContext, min_d: float = _min_dur
+        ) -> Optional[str]:
+            if ctx.duration_seconds is not None and ctx.duration_seconds < min_d:
+                return f"duration {ctx.duration_seconds:.1f}s < minimum {min_d}s"
+            return None
+
+        rules.append(_rule_min_duration)
+
+    # ------------------------------------------------------------------
+    # Rule: clip is longer than the maximum duration
+    # .env.json → ad_filter.ban_max_duration_sec  (0 = disabled)
+    # ------------------------------------------------------------------
+    if cfg.ban_max_duration_sec and cfg.ban_max_duration_sec > 0:
+        _max_dur: float = cfg.ban_max_duration_sec
+
+        def _rule_max_duration(
+            ctx: PostContext, max_d: float = _max_dur
+        ) -> Optional[str]:
+            if ctx.duration_seconds is not None and ctx.duration_seconds > max_d:
+                return f"duration {ctx.duration_seconds:.1f}s > maximum {max_d}s"
+            return None
+
+        rules.append(_rule_max_duration)
+
+    # ------------------------------------------------------------------
+    # Rule: file is larger than the maximum size
+    # .env.json → ad_filter.ban_max_file_size_mb  (0 = disabled)
+    # ------------------------------------------------------------------
+    if cfg.ban_max_file_size_mb and cfg.ban_max_file_size_mb > 0:
+        _max_mb: float = cfg.ban_max_file_size_mb
+
+        def _rule_max_size(
+            ctx: PostContext, max_mb: float = _max_mb
+        ) -> Optional[str]:
+            if ctx.file_size_mb is not None and ctx.file_size_mb > max_mb:
+                return f"file size {ctx.file_size_mb:.1f} MB > maximum {max_mb} MB"
+            return None
+
+        rules.append(_rule_max_size)
+
+    # ==================================================================
+    # Custom code-level rules — add your own below this line.
+    # Each rule must match the signature:
+    #   (ctx: PostContext) -> Optional[str]
+    # Return None to pass, return a string reason to ban.
+    #
+    # Available ctx fields:
+    #   text, channel_name, post_id, date
+    #   views, forwards, replies, reactions_total, reactions
+    #   has_media, media_type
+    #   file_size_bytes, file_size_mb   (always populated)
+    #   duration_seconds                (populated when ffprobe passed)
+    # ==================================================================
+
+    # Example: ban very short clips (likely teasers / reposts).
+    #
+    # def _rule_too_short(ctx: PostContext) -> Optional[str]:
+    #     if ctx.duration_seconds is not None and ctx.duration_seconds < 3:
+    #         return f"clip too short ({ctx.duration_seconds:.1f}s)"
+    #     return None
+    # rules.append(_rule_too_short)
+
+    # Example: ban posts that contain external (non-Telegram) URLs.
+    #
+    # _external_url_rx = re.compile(r"https?://(?!t\.me)\S+", re.IGNORECASE)
+    # def _rule_external_url(ctx: PostContext) -> Optional[str]:
+    #     if _external_url_rx.search(ctx.text):
+    #         return "text contains external URL"
+    #     return None
+    # rules.append(_rule_external_url)
+
+    # Example: ban posts from a specific channel regardless of text.
+    #
+    # def _rule_ban_channel(ctx: PostContext) -> Optional[str]:
+    #     if ctx.channel_name == "some_channel_folder_name":
+    #         return "channel banned"
+    #     return None
+    # rules.append(_rule_ban_channel)
+
+    # Example: ban posts with a suspicious reactions-to-views ratio
+    # (bots often produce many reactions with few views).
+    #
+    # def _rule_reaction_ratio(ctx: PostContext) -> Optional[str]:
+    #     if ctx.views and ctx.reactions_total:
+    #         ratio = ctx.reactions_total / ctx.views
+    #         if ratio > 0.5:
+    #             return f"suspicious reaction ratio {ratio:.2f}"
+    #     return None
+    # rules.append(_rule_reaction_ratio)
+
+    return rules
+
+
+def filter_videos_by_rules(
+    videos: list[Path],
+    work_dir: Path,
+    rules: list[BanRule],
+    ffprobe: Optional[Path] = None,
+) -> list[Path]:
+    """
+    Apply ban rules to every video and return only those that pass all rules.
+
+    For each video the first matching rule wins (short-circuit evaluation).
+    Banned videos are logged at INFO level with the triggering rule reason.
+
+    ffprobe: when provided, duration_seconds is populated in PostContext via a
+    lightweight format probe.  Required by ban_min_duration_sec /
+    ban_max_duration_sec rules.  When None, duration_seconds is always None.
+    """
+    if not rules:
+        return videos
+
+    needs_probe = ffprobe is not None
+    if needs_probe:
+        logger.debug(f"Ad filter: ffprobe duration probing enabled ({ffprobe})")
+
+    passed: list[Path] = []
+    banned_count: int = 0
+
+    for video in videos:
+        ctx: PostContext = _load_post_context(video, work_dir, ffprobe=ffprobe)
+        ban_reason: Optional[str] = None
+
+        for rule in rules:
+            reason = rule(ctx)
+            if reason:
+                ban_reason = reason
+                break
+
+        if ban_reason:
+            size_str = f"  [{ctx.file_size_mb:.1f} MB]" if ctx.file_size_mb is not None else ""
+            dur_str = f"  [{ctx.duration_seconds:.1f}s]" if ctx.duration_seconds is not None else ""
+            logger.info(
+                f"FILTERED: [{ctx.channel_name}] post {ctx.post_id} "
+                f"({video.name}){size_str}{dur_str} — {ban_reason}"
+            )
+            banned_count += 1
+        else:
+            passed.append(video)
+
+    if banned_count:
+        logger.info(
+            f"Ad filter: {banned_count} video(s) excluded, "
+            f"{len(passed)} video(s) passed"
+        )
+
+    return passed
 
 
 def _scan_post_dirs(channel_dir: Path, videos: list[tuple[datetime, Path]]) -> None:
@@ -615,7 +1096,9 @@ Examples:
   python join_video.py --work-dir H:\\TEMP\\vk_vsf\\babazoyka --output babazoyka_full.mp4
   python join_video.py --output result.mp4 --start-date 2025-11-01 --end-date 2025-11-30
   python join_video.py --output result.mp4 --audio-delay-ms 200
-  python join_video.py --output result.mp4 --audio-delay-ms -150
+  python join_video.py --output result.mp4 --sort interest-asc
+  python join_video.py --output result.mp4 --sort interest-desc --start-date 2026-01-01
+  python join_video.py --output result.mp4 --no-ad-filter
         """,
     )
     parser.add_argument(
@@ -632,9 +1115,15 @@ Examples:
     )
     parser.add_argument(
         "--sort",
-        choices=["asc", "desc"],
+        choices=["asc", "desc", "interest-asc", "interest-desc"],
         default="asc",
-        help="Sort order: asc = oldest first, desc = newest first (default: asc)",
+        help=(
+            "Sort order. "
+            "asc / desc = by date (oldest/newest first). "
+            "interest-asc = least interesting first (builds to climax). "
+            "interest-desc = most interesting first. "
+            "Default: asc"
+        ),
     )
     parser.add_argument(
         "--start-date",
@@ -662,12 +1151,21 @@ Examples:
             f"Default from .env AUDIO_DELAY_MS: {default_audio_delay_ms}"
         ),
     )
+    parser.add_argument(
+        "--no-ad-filter",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable the ad/spam filter even when rules are configured in .env.json "
+            "(ad_filter section). Useful for debugging to see the full unfiltered list."
+        ),
+    )
 
     args = parser.parse_args()
     logger.debug(
         f"Parsed args: work_dir={args.work_dir!r}, output={args.output!r}, "
         f"sort={args.sort!r}, start_date={args.start_date}, end_date={args.end_date}, "
-        f"audio_delay_ms={args.audio_delay_ms}"
+        f"audio_delay_ms={args.audio_delay_ms}, no_ad_filter={args.no_ad_filter}"
     )
 
     work_dir = Path(args.work_dir)
@@ -683,6 +1181,8 @@ Examples:
     logger.info(f"Using ffprobe: {ffprobe}")
 
     videos = collect_videos(work_dir)
+
+    # Date-based sort (default collect_videos already sorts by date asc)
     if args.sort == "desc":
         videos = list(reversed(videos))
 
@@ -697,16 +1197,65 @@ Examples:
         logger.error(f"No video files found in: {work_dir}")
         raise SystemExit(1)
 
+    # Ad / spam filter
+    if not args.no_ad_filter:
+        app_config = load_app_config()
+        ban_rules = build_ban_rules(app_config.ad_filter)
+        if ban_rules:
+            needs_duration = (
+                app_config.ad_filter.ban_min_duration_sec > 0
+                or app_config.ad_filter.ban_max_duration_sec > 0
+            )
+            logger.info(
+                f"Ad filter: {len(ban_rules)} rule(s) active"
+                + (" (ffprobe duration probing enabled)" if needs_duration else "")
+            )
+            videos = filter_videos_by_rules(
+                videos, work_dir, ban_rules,
+                ffprobe=ffprobe if needs_duration else None,
+            )
+            if not videos:
+                logger.error("All videos were excluded by the ad filter. Use --no-ad-filter to bypass.")
+                raise SystemExit(1)
+        else:
+            logger.debug("Ad filter: no rules configured, skipping")
+
+    # Interest-based sort
+    interest_scores: dict[Path, float] = {}
+    if args.sort in ("interest-asc", "interest-desc"):
+        weights = load_interest_weights()
+        logger.info(
+            f"Computing interest scores "
+            f"(weights: reactions={weights.reactions}, "
+            f"forwards={weights.forwards}, replies={weights.replies})"
+        )
+        interest_scores = compute_interest_scores(videos, weights)
+        reverse_order = args.sort == "interest-desc"
+        videos = sorted(videos, key=lambda v: interest_scores[v], reverse=reverse_order)
+        logger.info(
+            f"Sorted {len(videos)} video(s) by interest "
+            f"({'desc' if reverse_order else 'asc'})"
+        )
+
     logger.info(f"Found {len(videos)} video file(s)")
     for v in videos:
         meta_file = v.parent / "meta.json"
         date_str = ""
+        score_str = ""
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
             date_str = f"  [{meta.get('date', '')}]"
+            views = meta.get("views")
+            reactions = meta.get("reactions_total")
+            if views is not None:
+                date_str += f"  views={views}"
+            if reactions is not None:
+                date_str += f"  reactions={reactions}"
         except Exception:
             pass
-        logger.info(f"  {v}{date_str}")
+        if v in interest_scores:
+            score_str = f"  interest={interest_scores[v]:.4f}"
+        logger.info(f"  {v}{date_str}{score_str}")
 
     run_ffmpeg(ffmpeg, ffprobe, videos, output, work_dir, audio_delay_ms=args.audio_delay_ms)
 
