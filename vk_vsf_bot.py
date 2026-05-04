@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -65,6 +66,11 @@ class ChannelPost(BaseModel):
     has_media: bool = False
     media_type: Optional[str] = None
     date: str
+    views: Optional[int] = None
+    forwards: Optional[int] = None
+    replies: Optional[int] = None
+    reactions_total: Optional[int] = None
+    reactions: Optional[dict[str, int]] = None  # {"👍": 12, "❤": 5, ...}
 
     class Config:
         """Pydantic config."""
@@ -111,6 +117,35 @@ def build_client_kwargs() -> dict:
         }
     else:
         raise ValueError(f"Unsupported PROXY_TYPE: '{proxy_type}'. Use: socks5, socks4, mtproto")
+
+
+def parse_reactions(message) -> tuple[Optional[int], Optional[dict[str, int]]]:
+    """
+    Extract reaction counts from a Telethon message.
+
+    Returns:
+        (reactions_total, reactions_breakdown) where breakdown maps
+        emoji string → count. Custom emoji are keyed as "custom:<doc_id>".
+        Both values are None if the message has no reactions.
+    """
+    msg_reactions = getattr(message, "reactions", None)
+    if not msg_reactions or not getattr(msg_reactions, "results", None):
+        return None, None
+
+    breakdown: dict[str, int] = {}
+    total: int = 0
+    for r in msg_reactions.results:
+        count: int = r.count
+        total += count
+        emoticon: Optional[str] = getattr(r.reaction, "emoticon", None)
+        if emoticon:
+            breakdown[emoticon] = count
+        else:
+            doc_id = getattr(r.reaction, "document_id", None)
+            if doc_id:
+                breakdown[f"custom:{doc_id}"] = count
+
+    return total, breakdown or None
 
 
 async def get_credentials() -> TelegramCredentials:
@@ -201,12 +236,18 @@ async def fetch_recent_posts(
             channel = await resolve_channel(client, channel_id, _work_dir / channel_to_folder_name(channel_id))
             result: list[ChannelPost] = []
             async for message in client.iter_messages(channel, limit=count):
+                reactions_total, reactions = parse_reactions(message)
                 post: ChannelPost = ChannelPost(
                     post_id=message.id,
                     text=message.text,
                     has_media=message.media is not None,
                     media_type=type(message.media).__name__ if message.media else None,
                     date=message.date.isoformat() if message.date else "Unknown",
+                    views=getattr(message, "views", None),
+                    forwards=getattr(message, "forwards", None),
+                    replies=getattr(message.replies, "replies", None) if getattr(message, "replies", None) else None,
+                    reactions_total=reactions_total,
+                    reactions=reactions,
                 )
                 result.append(post)
                 logger.debug(f"Fetched post {post.post_id}: {post.text[:50] if post.text else 'No text'}...")
@@ -246,6 +287,17 @@ async def display_posts(posts: list[ChannelPost]) -> None:
         logger.info(f"Has media: {post.has_media}")
         if post.media_type:
             logger.info(f"Media type: {post.media_type}")
+        if post.views is not None:
+            logger.info(f"Views: {post.views}")
+        if post.forwards is not None:
+            logger.info(f"Forwards: {post.forwards}")
+        if post.replies is not None:
+            logger.info(f"Replies: {post.replies}")
+        if post.reactions_total is not None:
+            breakdown: str = ""
+            if post.reactions:
+                breakdown = "  " + "  ".join(f"{e}×{c}" for e, c in post.reactions.items())
+            logger.info(f"Reactions: {post.reactions_total}{breakdown}")
         if post.text:
             text_preview: str = post.text[:200]
             logger.info(f"Text: {text_preview}{'...' if len(post.text) > 200 else ''}")
@@ -307,13 +359,43 @@ def normalize_channel_id(channel_id: str) -> str:
     """
     channel_id = channel_id.strip()
     if (
-        channel_id.startswith("http")      # full URL
-        or channel_id.startswith("@")      # already @username
-        or channel_id.startswith("+")      # private invite hash
+        channel_id.startswith("http")        # full URL
+        or channel_id.startswith("@")        # already @username
+        or channel_id.startswith("+")        # private invite hash
         or channel_id.lstrip("-").isdigit()  # numeric ID
     ):
         return channel_id
     return f"@{channel_id}"
+
+
+def parse_channels_env() -> list[str]:
+    """
+    Parse CHANNELS env var (comma-separated list) into normalized channel IDs.
+
+    Falls back to TARGET_CHANNEL if CHANNELS is not set.
+    Returns an empty list if neither is configured.
+
+    Examples of valid .env entries:
+      CHANNELS=@babazoyka
+      CHANNELS=@babazoyka, https://t.me/+5wnJFWU8yLZjNTdi, +otRtx2aMM0ZlMTVi
+    """
+    raw: str = os.getenv("CHANNELS", "").strip()
+    if raw:
+        channels: list[str] = [
+            normalize_channel_id(c)
+            for c in raw.split(",")
+            if c.strip()
+        ]
+        logger.debug(f"Parsed CHANNELS env: {channels}")
+        return channels
+
+    # Fallback: single TARGET_CHANNEL
+    target: str = os.getenv("TARGET_CHANNEL", "").strip()
+    if target:
+        logger.debug(f"CHANNELS not set, falling back to TARGET_CHANNEL: {target}")
+        return [normalize_channel_id(target)]
+
+    return []
 
 
 def channel_to_folder_name(channel_id: str) -> str:
@@ -362,9 +444,14 @@ async def download_channel_posts(
     channel_id: str,
     count: int,
     work_dir: Path,
+    since: Optional[datetime] = None,
 ) -> None:
     """
     Download recent posts from a channel into work/<channel>/<post_id>/.
+
+    Args:
+        since: If set, skip posts older than this datetime and stop iterating
+               once the boundary is crossed (posts are returned newest→oldest).
 
     Each post folder contains:
       meta.json       — post metadata (id, date, media type, views, forwards)
@@ -377,23 +464,37 @@ async def download_channel_posts(
 
     # Resolve once → get stable entity, cache numeric ID
     channel = await resolve_channel(client, channel_id, channel_dir)
-    logger.info(f"Saving posts to: {channel_dir}")
+    if since:
+        logger.info(f"Saving posts to: {channel_dir} (since {since.isoformat()})")
+    else:
+        logger.info(f"Saving posts to: {channel_dir}")
 
     downloaded: int = 0
     skipped: int = 0
+    total: int = 0  # incremented as we iterate (actual messages received)
 
     async for message in client.iter_messages(channel, limit=count):
+        total += 1
+
+        # iter_messages returns newest→oldest; once we go past the since boundary, stop
+        if since and message.date and message.date < since:
+            logger.info(f"[{total}] Post {message.id} ({message.date}) is before --since, stopping")
+            break
+
         post_dir: Path = channel_dir / str(message.id)
 
         # Skip already downloaded posts
         if (post_dir / "meta.json").exists():
-            logger.debug(f"Post {message.id} already downloaded, skipping")
+            logger.info(f"[{total}/{count}] Post {message.id}: already downloaded, skipping")
             skipped += 1
             continue
+
+        logger.info(f"[{total}/{count}] Post {message.id} ({message.date})")
 
         post_dir.mkdir(exist_ok=True)
 
         # Save metadata
+        reactions_total, reactions = parse_reactions(message)
         meta: dict = {
             "post_id": message.id,
             "date": message.date.isoformat() if message.date else None,
@@ -401,6 +502,9 @@ async def download_channel_posts(
             "media_type": type(message.media).__name__ if message.media else None,
             "views": getattr(message, "views", None),
             "forwards": getattr(message, "forwards", None),
+            "replies": getattr(message.replies, "replies", None) if getattr(message, "replies", None) else None,
+            "reactions_total": reactions_total,
+            "reactions": reactions,
         }
         (post_dir / "meta.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -417,37 +521,70 @@ async def download_channel_posts(
                     message, file=str(post_dir) + "/"
                 )
                 if media_path:
-                    logger.info(f"Post {message.id}: saved media → {Path(media_path).name}")
+                    logger.info(f"[{total}/{count}] Post {message.id}: saved media → {Path(media_path).name}")
                 else:
-                    logger.warning(f"Post {message.id}: media download returned None")
+                    logger.warning(f"[{total}/{count}] Post {message.id}: media download returned None")
             except Exception as e:
-                logger.error(f"Post {message.id}: media download failed: {e}")
-            # Longer pause after media download
+                logger.error(f"[{total}/{count}] Post {message.id}: media download failed: {e}")
             await _human_delay(short=False)
         else:
-            logger.info(f"Post {message.id}: text only")
-            # Short pause between posts
+            logger.info(f"[{total}/{count}] Post {message.id}: text only")
             await _human_delay(short=True)
 
         downloaded += 1
 
-    logger.info(f"Done: {downloaded} downloaded, {skipped} already existed")
+    logger.info(f"Done: {downloaded} downloaded, {skipped} already existed (total seen: {total})")
 
 
 async def cmd_download(args: argparse.Namespace) -> None:
     """
     Handle 'download' command — fetch posts with media into work/<channel>/.
+
+    Channel resolution:
+      --channel @foo      → single channel
+      --all-channels      → all channels from CHANNELS env var
+      (neither)           → TARGET_CHANNEL env var (single fallback)
     """
-    channel_id: str = args.channel or os.getenv("TARGET_CHANNEL", "")
-    channel_id = normalize_channel_id(channel_id)
-    count: int = args.count
     work_dir: Path = Path(args.work_dir)
 
-    if not channel_id:
-        logger.error("Channel not specified. Use --channel or set TARGET_CHANNEL in .env")
-        raise ValueError("Channel not specified")
+    # Determine channel list
+    if args.all_channels:
+        channels: list[str] = parse_channels_env()
+        if not channels:
+            logger.error("--all-channels: CHANNELS is not set in .env")
+            raise ValueError("CHANNELS not configured")
+    elif args.channel:
+        channels = [normalize_channel_id(args.channel)]
+    else:
+        target: str = os.getenv("TARGET_CHANNEL", "").strip()
+        if not target:
+            logger.error("No channel specified. Use --channel, --all-channels, or set TARGET_CHANNEL in .env")
+            raise ValueError("No channel specified")
+        channels = [normalize_channel_id(target)]
 
-    logger.info(f"Downloading {count} posts from {channel_id} → work/{channel_to_folder_name(channel_id)}/")
+    if not channels:
+        logger.error("No channels configured. Use --channel or set CHANNELS in .env")
+        raise ValueError("No channels configured")
+
+    count: int = args.count
+
+    # Parse --since date filter
+    since: Optional[datetime] = None
+    if args.since:
+        try:
+            since = datetime.fromisoformat(args.since)
+            # Make timezone-aware (UTC) if naive — Telegram dates are always UTC
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+            logger.info(f"Filtering posts since: {since.isoformat()}")
+        except ValueError:
+            logger.error(
+                f"Invalid --since value: {args.since!r}. "
+                "Use ISO format: 2026-04-01 or 2026-04-01T10:00:00"
+            )
+            raise ValueError(f"Invalid --since: {args.since!r}")
+
+    logger.info(f"Downloading {count} posts per channel from {len(channels)} channel(s): {channels}")
 
     try:
         credentials: TelegramCredentials = await get_credentials()
@@ -470,10 +607,17 @@ async def cmd_download(args: argparse.Namespace) -> None:
                 client.start(bot_token=credentials.bot_token), timeout=30
             )
 
-        await asyncio.wait_for(
-            download_channel_posts(client, channel_id, count, work_dir),
-            timeout=3600,  # 1 hour max for large downloads
-        )
+        for channel_id in channels:
+            logger.info(f"--- Channel: {channel_id} ---")
+            try:
+                await asyncio.wait_for(
+                    download_channel_posts(client, channel_id, count, work_dir, since),
+                    timeout=3600,
+                )
+            except Exception as e:
+                logger.error(f"Failed to download from {channel_id}: {e}")
+                # Continue with the next channel instead of aborting all
+
     except Exception as e:
         logger.error(f"Download error: {e}")
         raise
@@ -490,8 +634,10 @@ async def main() -> None:
 Examples:
   python vk_vsf_bot.py view-recent
   python vk_vsf_bot.py view-recent --channel @babazoyka --count 20
-  python vk_vsf_bot.py download
   python vk_vsf_bot.py download --channel @babazoyka --count 50
+  python vk_vsf_bot.py download --all-channels --count 20
+  python vk_vsf_bot.py download --all-channels --since 2026-04-01
+  python vk_vsf_bot.py download --all-channels --since 2026-04-01T10:00:00 --count 100
         """,
     )
 
@@ -524,8 +670,14 @@ Examples:
     download_parser.add_argument(
         "--channel",
         type=str,
-        default=os.getenv("TARGET_CHANNEL", ""),
-        help="Channel ID or username (default from .env)",
+        default="",
+        help="Single channel to download from (overrides --all-channels and TARGET_CHANNEL)",
+    )
+    download_parser.add_argument(
+        "--all-channels",
+        action="store_true",
+        default=False,
+        help="Download from all channels listed in CHANNELS env var",
     )
     download_parser.add_argument(
         "--count",
@@ -538,6 +690,17 @@ Examples:
         type=str,
         default=os.getenv("WORK_DIR", r"work"),
         help=r"Directory to save downloaded posts (default from .env: H:\TEMP\vk_vsf)",
+    )
+    download_parser.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        metavar="DATE",
+        help=(
+            "Only download posts published on or after this date. "
+            "Format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS (e.g. 2026-04-01 or 2026-04-01T10:00:00). "
+            "Stops iteration as soon as an older post is encountered."
+        ),
     )
     download_parser.set_defaults(func=cmd_download)
 

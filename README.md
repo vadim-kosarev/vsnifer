@@ -17,10 +17,12 @@
 
 - Просмотр последних постов из Telegram-каналов
 - Загрузка постов с медиафайлами (видео, фото, документы)
+- Пакетная загрузка сразу со всех каналов (`--all-channels`)
 - Идемпотентная загрузка — уже скачанные посты пропускаются
 - Кэширование числового ID канала (не зависит от смены username)
 - Поддержка прокси: SOCKS4, SOCKS5, MTProto (в т.ч. FakeTLS)
 - Объединение видео в один Full HD файл (1920×1080)
+- Надёжная обработка аудио через concat filter: разные sample rate, отсутствие аудиодорожки
 - Для вертикального и квадратного видео — размытый фон вместо чёрных полос
 - Сортировка видео по дате поста (из `meta.json`)
 
@@ -60,13 +62,13 @@ pip install -r requirements.txt
    - Заполните форму (App title, Shortname, Url — опционально)
    - Получите **API_ID** и **API_HASH**
 
-5. Создайте `.env` файл и заполните реальными значениями:
+5. Создайте `.env` файл на основе `.env.example` и заполните реальными значениями:
 ```
 API_ID=123456789
 API_HASH=abcdef1234567890abcdef1234567890
 PHONE=+79001234567
-BOT_TOKEN=8770438622:AAGG6eUujQuuSKsfs3cgevSNxN1afu_EOxQ
-TARGET_CHANNEL=+otRtx2aMM0ZlMTVi
+TARGET_CHANNEL=@babazoyka
+CHANNELS=@babazoyka, https://t.me/+otRtx2aMM0ZlMTVi, https://t.me/+5wnJFWU8yLZjNTdi
 WORK_DIR=H:\TEMP\vk_vsf
 ```
 
@@ -83,17 +85,28 @@ WORK_DIR=H:\TEMP\vk_vsf
 ### Авторизация (одно из двух)
 | Переменная | Описание |
 |---|---|
-| `PHONE` | Номер телефона пользователя (предпочтительно, позволяет читать любые каналы) |
+| `PHONE` | Номер телефона пользователя (предпочтительно — позволяет читать любые каналы) |
 | `BOT_TOKEN` | Token бота от BotFather (ограниченный доступ к каналам) |
 
-### Необязательные
+### Каналы
 | Переменная | Описание | По умолчанию |
 |---|---|---|
-| `TARGET_CHANNEL` | Канал по умолчанию | — |
+| `TARGET_CHANNEL` | Канал для `view-recent` и `download` без флагов | — |
+| `CHANNELS` | Список каналов для `download --all-channels`, через запятую | — |
+
+Форматы channel ID в `CHANNELS`: `@username`, `+<invite_hash>`, `https://t.me/+xxx`, числовой ID. Пробелы вокруг запятых допустимы.
+
+```
+CHANNELS=@babazoyka, https://t.me/+otRtx2aMM0ZlMTVi, +HRom-yzU75JhYzIy
+```
+
+### Прочие параметры
+| Переменная | Описание | По умолчанию |
+|---|---|---|
 | `RECENT_POSTS_COUNT` | Количество постов по умолчанию | `10` |
 | `WORK_DIR` | Рабочий каталог для загрузки | `work` |
 | `FFMPEG_HOME` | Путь к каталогу FFmpeg | берётся из PATH |
-| `DEBUG` | Режим отладки | — |
+| `LOG_LEVEL` | Уровень логирования: `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 
 ### Прокси (необязательно)
 | Переменная | Описание |
@@ -108,45 +121,50 @@ WORK_DIR=H:\TEMP\vk_vsf
 ### vk_vsf_bot.py — просмотр и загрузка постов
 
 ```powershell
-# Показывает справку
+# Справка
 python vk_vsf_bot.py
 python vk_vsf_bot.py --help
 
-# Просмотр последних 10 постов из канала по умолчанию
+# Просмотр последних 10 постов из TARGET_CHANNEL
 python vk_vsf_bot.py view-recent
 
-# Просмотр последних 20 постов
-python vk_vsf_bot.py view-recent --count 20
-
 # Просмотр постов из конкретного канала
-python vk_vsf_bot.py view-recent --channel @babazoyka --count 10
+python vk_vsf_bot.py view-recent --channel @babazoyka --count 20
 
-# Загрузка постов из канала по умолчанию (10 последних)
+# Загрузка из TARGET_CHANNEL (10 последних)
 python vk_vsf_bot.py download
 
-# Загрузка 50 постов из конкретного канала
+# Загрузка из одного канала явно
 python vk_vsf_bot.py download --channel @babazoyka --count 50
 
+# Пакетная загрузка со всех каналов из CHANNELS (по 20 постов с каждого)
+python vk_vsf_bot.py download --all-channels --count 20
+
 # Загрузка в указанный каталог
-python vk_vsf_bot.py download --channel @babazoyka --count 50 --work-dir H:\TEMP\vk_vsf
+python vk_vsf_bot.py download --all-channels --count 30 --work-dir H:\TEMP\vk_vsf
 ```
 
-Поддерживаемые форматы channel ID: `@username`, `+<invite_hash>`, `https://t.me/username`, числовой ID.
+**Приоритет выбора канала для `download`:**
+1. `--channel @foo` — один явный канал
+2. `--all-channels` — все каналы из `CHANNELS` в `.env`
+3. без флагов — `TARGET_CHANNEL` из `.env`
+
+При ошибке на одном канале загрузка остальных продолжается.
 
 ### join_video.py — объединение видео в один файл
 
 ```powershell
-# Показывает справку
+# Справка
 python join_video.py --help
 
 # Объединить видео из WORK_DIR в result.mp4
 python join_video.py --output result.mp4
 
-# Объединить видео из конкретного каталога
+# Объединить видео из конкретного подкаталога канала
 python join_video.py --work-dir H:\TEMP\vk_vsf\babazoyka --output babazoyka_full.mp4
 
 # Сортировка от новых к старым
-python join_video.py --output result.mp4 --sort desc
+python join_video.py --work-dir H:\TEMP\vk_vsf\babazoyka --output babazoyka_full.mp4 --sort desc
 ```
 
 ## Структура каталогов загрузки
@@ -166,16 +184,23 @@ WORK_DIR/
 - Разрешение: 1920×1080 (Full HD)
 - Видеокодек: H.264 High Profile, Level 4.1, CRF 23
 - Аудиокодек: AAC-LC, 192 kbps, 48 kHz, стерео
+- Обработка аудио: concat filter с `asetpts=N/SR/TB` — надёжная синхронизация при разных sample rate и channel layout между клипами; клипы без аудиодорожки заполняются тишиной автоматически
 - Для нестандартного соотношения сторон (вертикальное, квадратное): размытый фон вместо чёрных полос
 - Оптимизирован для стриминга (`+faststart`)
 
 ## Логи
 
-Логи сохраняются в папке `logs/bot.log` и выводятся в консоль.
+Каждый скрипт пишет в свой файл и в консоль:
+
+| Файл | Скрипт |
+|---|---|
+| `logs/vk_vsf_bot.log` | `vk_vsf_bot.py` |
+| `logs/join_video.log` | `join_video.py` |
+
+Уровень логирования задаётся через `LOG_LEVEL` в `.env`.
 
 ## О боте
 
 Зарегистрирован в BotFather: t.me/vk_vsf_bot
 
 Подробнее об API: https://core.telegram.org/bots/api
-
