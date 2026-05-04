@@ -15,13 +15,17 @@ from pathlib import Path
 from typing import Optional
 
 import argparse
-import socks
-import TelethonFakeTLS
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from telethon import TelegramClient
-from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.tl.types import Message
+
+from config import (
+    ConnectionDropMonitor,
+    ProxyManager,
+    ProxySwitchNeeded,
+    load_app_config,
+)
 
 # Load environment variables
 load_dotenv()
@@ -80,43 +84,13 @@ class ChannelPost(BaseModel):
 
 def build_client_kwargs() -> dict:
     """
-    Build TelegramClient extra kwargs (proxy / connection) from environment variables.
+    Build TelegramClient extra kwargs from the proxy list in .env.json,
+    falling back to the single-proxy settings in .env.
 
-    Supported PROXY_TYPE values: socks5, socks4, mtproto.
-    Returns empty dict if PROXY_TYPE is not set.
+    Kept for backward compatibility with fetch_recent_posts.
+    For download commands with rotation use ProxyManager directly.
     """
-    proxy_type: Optional[str] = os.getenv("PROXY_TYPE", "").lower().strip()
-    if not proxy_type:
-        return {}
-
-    proxy_host: Optional[str] = os.getenv("PROXY_HOST")
-    proxy_port_str: Optional[str] = os.getenv("PROXY_PORT")
-
-    if not proxy_host or not proxy_port_str:
-        raise ValueError("PROXY_HOST and PROXY_PORT must be set when PROXY_TYPE is defined")
-
-    proxy_port: int = int(proxy_port_str)
-
-    if proxy_type == "socks5":
-        return {"proxy": (socks.SOCKS5, proxy_host, proxy_port)}
-    elif proxy_type == "socks4":
-        return {"proxy": (socks.SOCKS4, proxy_host, proxy_port)}
-    elif proxy_type == "mtproto":
-        proxy_secret: str = os.getenv("PROXY_SECRET", "")
-        # ee-prefix = FakeTLS: TelethonFakeTLS prepends 'ee' itself, so strip it before passing
-        # dd-prefix or plain = randomized intermediate
-        if proxy_secret.lower().startswith("ee"):
-            secret_for_faketls: str = proxy_secret[2:]  # strip 'ee' — library adds it back internally
-            return {
-                "connection": TelethonFakeTLS.ConnectionTcpMTProxyFakeTLS,
-                "proxy": (proxy_host, proxy_port, secret_for_faketls),
-            }
-        return {
-            "connection": ConnectionTcpMTProxyRandomizedIntermediate,
-            "proxy": (proxy_host, proxy_port, proxy_secret),
-        }
-    else:
-        raise ValueError(f"Unsupported PROXY_TYPE: '{proxy_type}'. Use: socks5, socks4, mtproto")
+    return ProxyManager(load_app_config().proxies).build_client_kwargs()
 
 
 def parse_reactions(message) -> tuple[Optional[int], Optional[dict[str, int]]]:
@@ -537,14 +511,85 @@ async def download_channel_posts(
     logger.info(f"Done: {downloaded} downloaded, {skipped} already existed (total seen: {total})")
 
 
+async def _proxy_watchdog(monitor: ConnectionDropMonitor, check_interval: float = 15.0) -> None:
+    """
+    Periodically check the connection drop counter.
+    Raises ProxySwitchNeeded when the threshold is exceeded.
+    """
+    while True:
+        await asyncio.sleep(check_interval)
+        if monitor.should_switch():
+            raise ProxySwitchNeeded(
+                f"Connection dropped {monitor.drop_count} times — proxy switch required"
+            )
+
+
+async def _download_with_watchdog(
+    client: TelegramClient,
+    channel_id: str,
+    count: int,
+    work_dir: Path,
+    since: Optional[datetime],
+    monitor: ConnectionDropMonitor,
+) -> bool:
+    """
+    Run download_channel_posts concurrently with a proxy watchdog task.
+
+    Returns:
+        True  — the watchdog triggered a proxy switch (download was interrupted).
+        False — the download completed normally.
+
+    Raises any exception coming from the download task (non-proxy errors).
+    """
+    download_task = asyncio.create_task(
+        download_channel_posts(client, channel_id, count, work_dir, since)
+    )
+    watchdog_task = asyncio.create_task(_proxy_watchdog(monitor))
+
+    done, pending = await asyncio.wait(
+        {download_task, watchdog_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if watchdog_task in done and not watchdog_task.cancelled():
+        exc = watchdog_task.exception()
+        if isinstance(exc, ProxySwitchNeeded):
+            logger.warning(str(exc))
+            return True
+        if exc is not None:
+            raise exc
+
+    if download_task in done and not download_task.cancelled():
+        exc = download_task.exception()
+        if exc is not None:
+            raise exc
+
+    return False
+
+
 async def cmd_download(args: argparse.Namespace) -> None:
     """
     Handle 'download' command — fetch posts with media into work/<channel>/.
 
     Channel resolution:
-      --channel @foo      → single channel
-      --all-channels      → all channels from CHANNELS env var
-      (neither)           → TARGET_CHANNEL env var (single fallback)
+      --channel @foo      -> single channel
+      --all-channels      -> all channels from CHANNELS env var
+      (neither)           -> TARGET_CHANNEL env var (single fallback)
+
+    Proxy rotation:
+      Proxies are read from .env.json (proxies list).  A ConnectionDropMonitor
+      watches the Telethon connection logger for "Server closed the connection"
+      events.  When proxy_switch_max_drops drops occur within
+      proxy_switch_window_secs, the download is interrupted, the proxy is
+      advanced to the next one in the list, a new TelegramClient is created,
+      and the download resumes (already-downloaded posts are skipped).
     """
     work_dir: Path = Path(args.work_dir)
 
@@ -593,37 +638,77 @@ async def cmd_download(args: argparse.Namespace) -> None:
         logger.error(f"Credential error: {e}")
         raise
 
-    client: TelegramClient = TelegramClient(
-        "vsnifer_session",
-        credentials.api_id,
-        credentials.api_hash,
-        **build_client_kwargs(),
+    # --- Proxy manager + connection drop monitor --------------------------
+    app_config = load_app_config()
+    proxy_manager = ProxyManager(app_config.proxies)
+    monitor = ConnectionDropMonitor(
+        max_drops=app_config.proxy_switch_max_drops,
+        window_secs=app_config.proxy_switch_window_secs,
     )
+    monitor.attach()
 
-    try:
-        if credentials.phone:
-            await asyncio.wait_for(client.start(phone=credentials.phone), timeout=120)
-        else:
-            await asyncio.wait_for(
-                client.start(bot_token=credentials.bot_token), timeout=30
-            )
+    completed_channels: set[str] = set()
+    # At least one attempt; at most one attempt per proxy in the list.
+    max_attempts: int = max(proxy_manager.count, 1)
 
-        for channel_id in channels:
-            logger.info(f"--- Channel: {channel_id} ---")
-            try:
+    for attempt in range(max_attempts):
+        remaining: list[str] = [ch for ch in channels if ch not in completed_channels]
+        if not remaining:
+            break
+
+        if attempt > 0:
+            proxy_manager.advance()
+
+        logger.info(
+            f"Proxy attempt {attempt + 1}/{max_attempts}: {proxy_manager.describe_current()}"
+        )
+
+        client: TelegramClient = TelegramClient(
+            "vsnifer_session",
+            credentials.api_id,
+            credentials.api_hash,
+            **proxy_manager.build_client_kwargs(),
+        )
+
+        switch_triggered: bool = False
+        try:
+            if credentials.phone:
+                await asyncio.wait_for(client.start(phone=credentials.phone), timeout=120)
+            else:
                 await asyncio.wait_for(
-                    download_channel_posts(client, channel_id, count, work_dir, since),
-                    timeout=3600,
+                    client.start(bot_token=credentials.bot_token), timeout=30
                 )
-            except Exception as e:
-                logger.error(f"Failed to download from {channel_id}: {e}")
-                # Continue with the next channel instead of aborting all
 
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-        raise
-    finally:
-        await client.disconnect()
+            for channel_id in remaining:
+                logger.info(f"--- Channel: {channel_id} ---")
+                try:
+                    switch_triggered = await _download_with_watchdog(
+                        client, channel_id, count, work_dir, since, monitor
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to download from {channel_id}: {e}")
+                    switch_triggered = False
+
+                if switch_triggered:
+                    logger.warning(
+                        f"Proxy switch triggered during '{channel_id}' — "
+                        f"will reconnect and resume"
+                    )
+                    monitor.reset()
+                    break  # exit channel loop; outer loop reconnects with next proxy
+
+                completed_channels.add(channel_id)
+
+        except Exception as e:
+            logger.error(f"Client error on attempt {attempt + 1}: {e}")
+        finally:
+            await client.disconnect()
+
+    monitor.detach()
+    logger.info(
+        f"Download finished. "
+        f"Completed {len(completed_channels)}/{len(channels)} channel(s)."
+    )
 
 
 async def main() -> None:

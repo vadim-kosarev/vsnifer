@@ -381,7 +381,7 @@ def probe_video(ffprobe: Path, video: Path) -> Optional["VideoInfo"]:
     return VideoInfo(path=video, has_audio=has_audio, duration=duration)
 
 
-def build_filter_complex(videos_info: list[VideoInfo]) -> str:
+def build_filter_complex(videos_info: list[VideoInfo], audio_delay_ms: int = 0) -> str:
     """
     Build a filter_complex string using the concat filter.
 
@@ -398,6 +398,11 @@ def build_filter_complex(videos_info: list[VideoInfo]) -> str:
       Audio: [i:a] → resample → format → asetpts reset → [ai]
           or anullsrc → atrim(duration) → asetpts reset → [ai]  (no audio)
     Final: [v0][a0][v1][a1]... concat=n=N:v=1:a=1 → [vout][aout]
+
+    Audio sync correction (audio_delay_ms):
+      > 0 : audio is late  → trim first N ms from audio output (advance audio).
+      < 0 : audio is early → prepend N ms of silence to audio output (delay audio).
+      = 0 : no correction applied.
     """
     parts: list[str] = []
     concat_pads: list[str] = []
@@ -442,13 +447,33 @@ def build_filter_complex(videos_info: list[VideoInfo]) -> str:
         concat_pads.append(f"[v{i}][a{i}]")
 
     n: int = len(videos_info)
-    parts.append(f"{''.join(concat_pads)}concat=n={n}:v=1:a=1[vout][aout]")
+
+    if audio_delay_ms != 0:
+        # Concat outputs to a raw pad, then apply sync correction
+        parts.append(f"{''.join(concat_pads)}concat=n={n}:v=1:a=1[vout][aout_raw]")
+        delay_s: float = abs(audio_delay_ms) / 1000.0
+        if audio_delay_ms > 0:
+            # Audio is late: advance audio by trimming its beginning
+            logger.debug(f"Audio sync: advancing audio by {audio_delay_ms}ms (trim start)")
+            parts.append(
+                f"[aout_raw]atrim=start={delay_s:.6f},"
+                f"asetpts=N/SR/TB"
+                f"[aout]"
+            )
+        else:
+            # Audio is early: delay audio by prepending silence
+            delay_ms_str: str = f"{abs(audio_delay_ms)}"
+            logger.debug(f"Audio sync: delaying audio by {abs(audio_delay_ms)}ms (adelay)")
+            parts.append(f"[aout_raw]adelay={delay_ms_str}|{delay_ms_str}[aout]")
+    else:
+        parts.append(f"{''.join(concat_pads)}concat=n={n}:v=1:a=1[vout][aout]")
 
     return ";".join(parts)
 
 
 def run_ffmpeg(
-    ffmpeg: Path, ffprobe: Path, videos: list[Path], output: Path, work_dir: Path
+    ffmpeg: Path, ffprobe: Path, videos: list[Path], output: Path, work_dir: Path,
+    audio_delay_ms: int = 0,
 ) -> None:
     """
     Probe all videos, build a concat-filter command, and encode to Full HD.
@@ -464,6 +489,11 @@ def run_ffmpeg(
       - Chapter markers are embedded into the MP4 via an ffmetadata sidecar.
       - A plain-text timestamps file (<output>.timestamps.txt) is written
         next to the output for use in YouTube descriptions.
+
+    audio_delay_ms:
+      Positive: audio is late  → advance audio (trim audio start).
+      Negative: audio is early → delay audio (prepend silence).
+      Zero:     no sync correction.
     """
     logger.info(f"Probing {len(videos)} video file(s) with ffprobe...")
     probed: list[Optional[VideoInfo]] = [probe_video(ffprobe, v) for v in videos]
@@ -488,8 +518,11 @@ def run_ffmpeg(
         f"total duration: {total_h:02d}:{total_m:02d}:{total_s:02d} "
         f"({total_seconds:.1f}s)"
     )
+    if audio_delay_ms != 0:
+        direction = "advance" if audio_delay_ms > 0 else "delay"
+        logger.info(f"Audio sync correction: {direction} audio by {abs(audio_delay_ms)}ms")
 
-    filter_complex: str = build_filter_complex(videos_info)
+    filter_complex: str = build_filter_complex(videos_info, audio_delay_ms=audio_delay_ms)
 
     # Each video is a separate -i input
     inputs: list[str] = []
@@ -571,6 +604,7 @@ def run_ffmpeg(
 
 def main() -> None:
     default_work_dir: str = os.getenv("WORK_DIR", r"H:\TEMP\vk_vsf")
+    default_audio_delay_ms: int = int(os.getenv("AUDIO_DELAY_MS", "0"))
 
     parser = argparse.ArgumentParser(
         description="Concatenate downloaded channel videos into one Full HD file",
@@ -580,6 +614,8 @@ Examples:
   python join_video.py --output result.mp4
   python join_video.py --work-dir H:\\TEMP\\vk_vsf\\babazoyka --output babazoyka_full.mp4
   python join_video.py --output result.mp4 --start-date 2025-11-01 --end-date 2025-11-30
+  python join_video.py --output result.mp4 --audio-delay-ms 200
+  python join_video.py --output result.mp4 --audio-delay-ms -150
         """,
     )
     parser.add_argument(
@@ -614,11 +650,24 @@ Examples:
         metavar="YYYY-MM-DD",
         help="Include only videos posted on or before this date (inclusive)",
     )
+    parser.add_argument(
+        "--audio-delay-ms",
+        type=int,
+        default=default_audio_delay_ms,
+        metavar="MS",
+        help=(
+            "Audio sync correction in milliseconds. "
+            "Positive: audio is late, advance audio (trim start). "
+            "Negative: audio is early, delay audio (add silence). "
+            f"Default from .env AUDIO_DELAY_MS: {default_audio_delay_ms}"
+        ),
+    )
 
     args = parser.parse_args()
     logger.debug(
         f"Parsed args: work_dir={args.work_dir!r}, output={args.output!r}, "
-        f"sort={args.sort!r}, start_date={args.start_date}, end_date={args.end_date}"
+        f"sort={args.sort!r}, start_date={args.start_date}, end_date={args.end_date}, "
+        f"audio_delay_ms={args.audio_delay_ms}"
     )
 
     work_dir = Path(args.work_dir)
@@ -659,7 +708,7 @@ Examples:
             pass
         logger.info(f"  {v}{date_str}")
 
-    run_ffmpeg(ffmpeg, ffprobe, videos, output, work_dir)
+    run_ffmpeg(ffmpeg, ffprobe, videos, output, work_dir, audio_delay_ms=args.audio_delay_ms)
 
 
 if __name__ == "__main__":
