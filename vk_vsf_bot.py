@@ -472,24 +472,25 @@ async def download_channel_posts(
     downloaded: int = 0
     skipped: int = 0
     total: int = 0  # incremented as we iterate (actual messages received)
+    ch: str = channel_dir.name  # short channel label for log messages
 
     async for message in client.iter_messages(channel, limit=count):
         total += 1
 
         # iter_messages returns newest→oldest; once we go past the since boundary, stop
         if since and message.date and message.date < since:
-            logger.info(f"[{total}] Post {message.id} ({message.date}) is before --since, stopping")
+            logger.info(f"[{ch}][{total}] Post {message.id} ({message.date}) is before --since, stopping")
             break
 
         post_dir: Path = channel_dir / str(message.id)
 
         # Skip already downloaded posts
         if (post_dir / "meta.json").exists():
-            logger.info(f"[{total}/{count}] Post {message.id}: already downloaded, skipping")
+            logger.info(f"[{ch}][{total}/{count}] Post {message.id}: already downloaded, skipping")
             skipped += 1
             continue
 
-        logger.info(f"[{total}/{count}] Post {message.id} ({message.date})")
+        logger.info(f"[{ch}][{total}/{count}] Post {message.id} ({message.date})")
 
         post_dir.mkdir(exist_ok=True)
 
@@ -521,14 +522,14 @@ async def download_channel_posts(
                     message, file=str(post_dir) + "/"
                 )
                 if media_path:
-                    logger.info(f"[{total}/{count}] Post {message.id}: saved media → {Path(media_path).name}")
+                    logger.info(f"[{ch}][{total}/{count}] Post {message.id}: saved media → {Path(media_path).name}")
                 else:
-                    logger.warning(f"[{total}/{count}] Post {message.id}: media download returned None")
+                    logger.warning(f"[{ch}][{total}/{count}] Post {message.id}: media download returned None")
             except Exception as e:
-                logger.error(f"[{total}/{count}] Post {message.id}: media download failed: {e}")
+                logger.error(f"[{ch}][{total}/{count}] Post {message.id}: media download failed: {e}")
             await _human_delay(short=False)
         else:
-            logger.info(f"[{total}/{count}] Post {message.id}: text only")
+            logger.info(f"[{ch}][{total}/{count}] Post {message.id}: text only")
             await _human_delay(short=True)
 
         downloaded += 1
