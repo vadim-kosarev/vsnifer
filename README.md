@@ -12,6 +12,7 @@
 |---|---|
 | `vk_vsf_bot.py` | Подключается к Telegram-каналам, просматривает и скачивает посты с медиа |
 | `join_video.py` | Объединяет скачанные видеофайлы в один Full HD файл через FFmpeg |
+| `check_ad.py` | LLM-классификатор рекламы: обходит скачанные посты и дописывает `ad_check` в `meta.json` |
 | `config.py` | Конфигурация, управление прокси, ротация MTProxy, фильтр рекламы |
 | `.env` | Учётные данные и параметры (не коммитится) |
 | `.env.json` | Расширенная конфигурация: список прокси, правила фильтрации рекламы |
@@ -32,7 +33,7 @@
 
 ### Объединение видео (`join_video.py`)
 
-- Объединение видео из нескольких каналов в один Full HD файл (1920×1080)
+- Объединение видео из нескольких каналов в один файл Full HD горизонтальный (1920×1080) или вертикальный (1080×1920, Reels/Shorts/TikTok)
 - Надёжная обработка аудио через concat filter: разные sample rate, отсутствие аудиодорожки (заполняется тишиной)
 - Для вертикального и квадратного видео — размытый фон вместо чёрных полос
 - Главы (chapters) в MP4 с метками по каналу/посту
@@ -42,11 +43,21 @@
 - Коррекция рассинхрона аудио/видео (`--audio-delay-ms`)
 - Фильтрация рекламных роликов по правилам из `.env.json`
 
+### LLM-классификация рекламы (`check_ad.py`)
+
+- Обходит `WORK_DIR`, находит посты без отметки `ad_check` в `meta.json`
+- Отправляет в локальный Ollama по 5 постов за запрос — быстро и без лишней нагрузки
+- Дописывает результат прямо в `meta.json`: `ad_rate` (0.0–1.0) и `proof_of_ad` (объяснение)
+- Идемпотентно — уже проверенные посты пропускаются (переопределяется `--force`)
+- `--dry-run` — покажет что будет обработано без единого запроса к LLM
+- Работает с любой моделью Ollama через `--model` или `OLLAMA_MODEL` в `.env`
+
 ## Установка
 
 ### Требования
 - Python 3.10+
 - FFmpeg 6+ (для объединения видео)
+- Ollama (для `check_ad.py`) — https://ollama.com
 
 ### Шаги
 
@@ -93,7 +104,7 @@ pip install -r requirements.txt
 | Переменная | Описание |
 |---|---|
 | `TARGET_CHANNEL` | Канал по умолчанию для `view-recent` и `download` без флагов |
-| `CHANNELS` | Список каналов через запятую для `download --all-channels` |
+| `CHANNELS` | Список каналов через запятую для `download --all-channels` и белый список для `check_ad.py` |
 | `RECENT_POSTS_COUNT` | Кол-во постов по умолчанию (default: `10`) |
 
 Форматы: `@username`, `+<invite_hash>`, `https://t.me/+xxx`, числовой ID.
@@ -124,6 +135,13 @@ CHANNELS=@babazoyka, https://t.me/+otRtx2aMM0ZlMTVi, +HRom-yzU75JhYzIy
 | `INTEREST_W_REACTIONS` | Вес реакций для interest-score | `10` |
 | `INTEREST_W_FORWARDS` | Вес форвардов | `5` |
 | `INTEREST_W_REPLIES` | Вес ответов | `2` |
+
+#### Параметры check_ad.py (Ollama)
+| Переменная | Описание | По умолчанию |
+|---|---|---|
+| `OLLAMA_BASE_URL` | URL сервера Ollama | `http://localhost:11434` |
+| `OLLAMA_MODEL` | Модель для классификации | `qwen3.5:9b` |
+| `OLLAMA_TIMEOUT_SEC` | Таймаут запроса в секундах | `300` |
 
 ---
 
@@ -226,6 +244,57 @@ python vk_vsf_bot.py download --all-channels --count 100 --work-dir H:\TEMP\vk_v
 3. без флагов — `TARGET_CHANNEL` из `.env`
 
 При ошибке на одном канале загрузка остальных продолжается.
+
+---
+
+### `check_ad.py` — LLM-классификация рекламы
+
+#### Параметры команды `update`
+
+| Параметр | Описание | Умолчание |
+|---|---|---|
+| `--work-dir` | Рабочий каталог с постами | `WORK_DIR` из `.env` |
+| `--channel NAME` | Обработать только этот канал (имя папки) | все каналы |
+| `--batch-size N` | Постов за один запрос к LLM | `5` |
+| `--model MODEL` | Модель Ollama | `OLLAMA_MODEL` из `.env` |
+| `--force` | Перепроверить уже проверенные посты | выкл. |
+| `--dry-run` | Показать что будет обработано, без запросов к LLM | выкл. |
+| `--limit N` | Обработать не более N постов (для теста) | без ограничений |
+| `--think` | Включить chain-of-thought в модели (медленней) | выкл. |
+
+```powershell
+# Справка
+python check_ad.py
+python check_ad.py update --help
+
+# Посмотреть что будет обработано (без запросов к LLM)
+python check_ad.py update --dry-run
+
+# Проверить первые 5 постов (один батч)
+python check_ad.py update --limit 5
+
+# Проверить один канал
+python check_ad.py update --channel babazoyka
+
+# Перепроверить уже проверенные посты
+python check_ad.py update --force --limit 10
+
+# Запустить на всё что есть
+python check_ad.py update
+
+# С отладочным выводом промптов и ответа LLM
+python check_ad.py --log-level DEBUG update --limit 5
+```
+
+Результат дописывается в каждый `meta.json`:
+```json
+"ad_check": {
+  "ad_rate": 0.9,
+  "proof_of_ad": "Пост продвигает канал микроМИР через invite-ссылку, которой нет в белом списке."
+}
+```
+
+`ad_rate`: `0.0` = точно не реклама, `1.0` = точно реклама.
 
 ---
 
@@ -345,7 +414,7 @@ WORK_DIR/
     channel_id.txt        — кэш числового ID канала
     <post_id>/
       meta.json           — метаданные поста (id, date, media_type,
-                            views, forwards, replies, reactions)
+                            views, forwards, replies, reactions, ad_check)
       text.txt            — текст поста (если есть)
       <video_file>.mp4    — медиафайл
 ```
@@ -362,9 +431,15 @@ WORK_DIR/
   "forwards": 15,
   "replies": null,
   "reactions_total": 20,
-  "reactions": { "🌚": 11, "😁": 9 }
+  "reactions": { "🌚": 11, "😁": 9 },
+  "ad_check": {
+    "ad_rate": 0.05,
+    "proof_of_ad": "Мем без ссылок на сторонние каналы, короткая подпись с эмодзи."
+  }
 }
 ```
+
+`ad_check` добавляется скриптом `check_ad.py update`. До запуска этого скрипта поле отсутствует.
 
 ## Выходной видеофайл
 
@@ -386,5 +461,6 @@ WORK_DIR/
 |---|---|
 | `logs/vk_vsf_bot.log` | `vk_vsf_bot.py` |
 | `logs/join_video.log` | `join_video.py` |
+| `logs/check_ad.log` | `check_ad.py` |
 
 Уровень задаётся через `LOG_LEVEL` в `.env`. Логи пишутся одновременно в файл и в консоль.
