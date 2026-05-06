@@ -419,6 +419,7 @@ async def download_channel_posts(
     count: int,
     work_dir: Path,
     since: Optional[datetime] = None,
+    refresh_meta: bool = False,
 ) -> None:
     """
     Download recent posts from a channel into work/<channel>/<post_id>/.
@@ -426,6 +427,9 @@ async def download_channel_posts(
     Args:
         since: If set, skip posts older than this datetime and stop iterating
                once the boundary is crossed (posts are returned newest→oldest).
+        refresh_meta: If True, re-fetch and overwrite meta.json / text.txt for
+               every post (including already-downloaded ones) without touching
+               existing media files.
 
     Each post folder contains:
       meta.json       — post metadata (id, date, media type, views, forwards)
@@ -438,13 +442,15 @@ async def download_channel_posts(
 
     # Resolve once → get stable entity, cache numeric ID
     channel = await resolve_channel(client, channel_id, channel_dir)
+    mode_label: str = " [refresh-meta]" if refresh_meta else ""
     if since:
-        logger.info(f"Saving posts to: {channel_dir} (since {since.isoformat()})")
+        logger.info(f"Saving posts to: {channel_dir} (since {since.isoformat()}){mode_label}")
     else:
-        logger.info(f"Saving posts to: {channel_dir}")
+        logger.info(f"Saving posts to: {channel_dir}{mode_label}")
 
     downloaded: int = 0
     skipped: int = 0
+    refreshed: int = 0
     total: int = 0  # incremented as we iterate (actual messages received)
     ch: str = channel_dir.name  # short channel label for log messages
 
@@ -457,18 +463,28 @@ async def download_channel_posts(
             break
 
         post_dir: Path = channel_dir / str(message.id)
+        meta_exists: bool = (post_dir / "meta.json").exists()
 
-        # Skip already downloaded posts
-        if (post_dir / "meta.json").exists():
+        # In refresh-meta mode skip posts that were never downloaded
+        if refresh_meta and not meta_exists:
+            logger.debug(f"[{ch}][{total}/{count}] Post {message.id}: not downloaded, skipping in refresh mode")
+            skipped += 1
+            continue
+
+        # In normal mode skip already downloaded posts
+        if meta_exists and not refresh_meta:
             logger.info(f"[{ch}][{total}/{count}] Post {message.id}: already downloaded, skipping")
             skipped += 1
             continue
 
-        logger.info(f"[{ch}][{total}/{count}] Post {message.id} ({message.date})")
+        if refresh_meta and meta_exists:
+            logger.info(f"[{ch}][{total}/{count}] Post {message.id} ({message.date}): refreshing meta")
+        else:
+            logger.info(f"[{ch}][{total}/{count}] Post {message.id} ({message.date})")
 
         post_dir.mkdir(exist_ok=True)
 
-        # Save metadata
+        # Save / overwrite metadata
         reactions_total, reactions = parse_reactions(message)
         meta: dict = {
             "post_id": message.id,
@@ -485,9 +501,18 @@ async def download_channel_posts(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        # Save text
+        # Save / overwrite text
         if message.text:
             (post_dir / "text.txt").write_text(message.text, encoding="utf-8")
+        elif (post_dir / "text.txt").exists() and refresh_meta:
+            # Post no longer has text — remove stale file
+            (post_dir / "text.txt").unlink()
+
+        if refresh_meta and meta_exists:
+            # Meta-only refresh — do not download media
+            refreshed += 1
+            await _human_delay(short=True)
+            continue
 
         # Download media
         if message.media:
@@ -508,7 +533,10 @@ async def download_channel_posts(
 
         downloaded += 1
 
-    logger.info(f"Done: {downloaded} downloaded, {skipped} already existed (total seen: {total})")
+    if refresh_meta:
+        logger.info(f"Done: {refreshed} meta refreshed, {downloaded} new, {skipped} skipped (total seen: {total})")
+    else:
+        logger.info(f"Done: {downloaded} downloaded, {skipped} already existed (total seen: {total})")
 
 
 async def _proxy_watchdog(monitor: ConnectionDropMonitor, check_interval: float = 15.0) -> None:
@@ -531,6 +559,7 @@ async def _download_with_watchdog(
     work_dir: Path,
     since: Optional[datetime],
     monitor: ConnectionDropMonitor,
+    refresh_meta: bool = False,
 ) -> bool:
     """
     Run download_channel_posts concurrently with a proxy watchdog task.
@@ -542,7 +571,7 @@ async def _download_with_watchdog(
     Raises any exception coming from the download task (non-proxy errors).
     """
     download_task = asyncio.create_task(
-        download_channel_posts(client, channel_id, count, work_dir, since)
+        download_channel_posts(client, channel_id, count, work_dir, since, refresh_meta)
     )
     watchdog_task = asyncio.create_task(_proxy_watchdog(monitor))
 
@@ -613,6 +642,7 @@ async def cmd_download(args: argparse.Namespace) -> None:
         raise ValueError("No channels configured")
 
     count: int = args.count
+    refresh_meta: bool = getattr(args, "refresh_meta", False)
 
     # Parse --since date filter
     since: Optional[datetime] = None
@@ -683,7 +713,7 @@ async def cmd_download(args: argparse.Namespace) -> None:
                 logger.info(f"--- Channel: {channel_id} ---")
                 try:
                     switch_triggered = await _download_with_watchdog(
-                        client, channel_id, count, work_dir, since, monitor
+                        client, channel_id, count, work_dir, since, monitor, refresh_meta
                     )
                 except Exception as e:
                     logger.error(f"Failed to download from {channel_id}: {e}")
@@ -724,6 +754,7 @@ Examples:
   python vk_vsf_bot.py download --all-channels --count 20
   python vk_vsf_bot.py download --all-channels --since 2026-04-01
   python vk_vsf_bot.py download --all-channels --since 2026-04-01T10:00:00 --count 100
+  python vk_vsf_bot.py download --all-channels --count 200 --refresh-meta
         """,
     )
 
@@ -786,6 +817,16 @@ Examples:
             "Only download posts published on or after this date. "
             "Format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS (e.g. 2026-04-01 or 2026-04-01T10:00:00). "
             "Stops iteration as soon as an older post is encountered."
+        ),
+    )
+    download_parser.add_argument(
+        "--refresh-meta",
+        action="store_true",
+        default=False,
+        dest="refresh_meta",
+        help=(
+            "Re-fetch and overwrite meta.json and text.txt for all posts "
+            "(including already-downloaded ones). Media files are not touched."
         ),
     )
     download_parser.set_defaults(func=cmd_download)

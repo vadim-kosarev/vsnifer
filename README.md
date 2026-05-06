@@ -38,7 +38,7 @@
 - Главы (chapters) в MP4 с метками по каналу/посту
 - Файл тайм-кодов для YouTube-описания (`<output>.timestamps.txt`)
 - Несколько режимов сортировки
-- Фильтрация по диапазону дат (`--start-date`, `--end-date`)
+- Фильтрация по диапазону дат (`--start-date`, `--end-date`) или за последние N дней (`--last-days`)
 - Коррекция рассинхрона аудио/видео (`--audio-delay-ms`)
 - Фильтрация рекламных роликов по правилам из `.env.json`
 
@@ -186,6 +186,16 @@ CHANNELS=@babazoyka, https://t.me/+otRtx2aMM0ZlMTVi, +HRom-yzU75JhYzIy
 
 ### `vk_vsf_bot.py` — просмотр и загрузка
 
+#### Параметры и их умолчания
+
+| Параметр | Возможные значения | Умолчание |
+|---|---|---|
+| `--channel` | `@username`, `+invite_hash`, `https://t.me/+xxx`, числовой ID | `TARGET_CHANNEL` из `.env` |
+| `--count` | целое число ≥ 1 | `RECENT_POSTS_COUNT` из `.env` → `10` |
+| `--work-dir` | путь к каталогу | `WORK_DIR` из `.env` → `work` |
+| `--since` | `YYYY-MM-DD` или `YYYY-MM-DDTHH:MM:SS` | не задано — без ограничения по дате |
+| `--refresh-meta` | флаг (без значения) | выкл. — уже скачанные посты пропускаются |
+
 ```powershell
 # Справка
 python vk_vsf_bot.py
@@ -221,6 +231,20 @@ python vk_vsf_bot.py download --all-channels --count 100 --work-dir H:\TEMP\vk_v
 
 ### `join_video.py` — объединение видео
 
+#### Параметры и их умолчания
+
+| Параметр | Возможные значения | Умолчание |
+|---|---|---|
+| `--work-dir` | путь к каталогу | `WORK_DIR` из `.env` → `H:\TEMP\vk_vsf` |
+| `--output` | путь к файлу `.mp4` | **обязательный** |
+| `--sort` | `asc`, `desc`, `interest-asc`, `interest-desc` | `asc` |
+| `--start-date` | `YYYY-MM-DD` | не задано — без нижней границы |
+| `--end-date` | `YYYY-MM-DD` | не задано — без верхней границы |
+| `--last-days` | целое число ≥ 1, допускается суффикс `d` (например `7` или `7d`) | не задано — фильтр выкл. |
+| `--audio-delay-ms` | целое число в мс, положительное или отрицательное | `AUDIO_DELAY_MS` из `.env` → `0` |
+| `--orientation` | `horizontal`, `vertical` | `horizontal` (1920×1080) |
+| `--no-ad-filter` | флаг (без значения) | выкл. — фильтр рекламы активен |
+
 ```powershell
 # Справка
 python join_video.py --help
@@ -243,15 +267,38 @@ python join_video.py --output result.mp4 --sort interest-desc
 # Только ролики за определённый период
 python join_video.py --output result.mp4 --start-date 2026-01-01 --end-date 2026-04-30
 
+# Только ролики за последние 7 дней (включая сегодня)
+python join_video.py --output result.mp4 --last-days 7
+
+# То же самое с суффиксом 'd'
+python join_video.py --output result.mp4 --last-days 7d
+
 # Коррекция рассинхрона аудио (+200 мс — аудио запаздывало)
 python join_video.py --output result.mp4 --audio-delay-ms 200
 
 # Отключить фильтр рекламы (показать все ролики без исключений)
 python join_video.py --output result.mp4 --no-ad-filter
 
+# Вертикальное видео (Reels / Shorts / TikTok) — 1080×1920
+python join_video.py --output result_vertical.mp4 --orientation vertical
+
+# Вертикальное + за последние 7 дней + по интересности
+python join_video.py --output result_vertical.mp4 --orientation vertical --last-days 7 --sort interest-asc
+
 # Несколько опций вместе
+python join_video.py --output result.mp4 --sort interest-asc --last-days 7 --audio-delay-ms 250
 python join_video.py --output result.mp4 --sort interest-asc --start-date 2026-01-01 --audio-delay-ms 250
 ```
+
+#### Фильтрация по дате
+
+| Параметр | Описание |
+|---|---|
+| `--start-date YYYY-MM-DD` | Включить только ролики, опубликованные начиная с этой даты (включительно) |
+| `--end-date YYYY-MM-DD` | Включить только ролики, опубликованные не позже этой даты (включительно) |
+| `--last-days N` | Включить только ролики за последние N дней, включая сегодня. Принимает `7` или `7d`. Перекрывает `--start-date`. |
+
+`--last-days 7` эквивалентно `--start-date <6 дней назад>` (сегодня + 6 предыдущих = 7 дней).
 
 #### Параметры сортировки
 
@@ -321,15 +368,15 @@ WORK_DIR/
 
 ## Выходной видеофайл
 
-| Параметр | Значение |
-|---|---|
-| Разрешение | 1920×1080 (Full HD) |
-| Видеокодек | H.264 High Profile, Level 4.1, CRF 23 |
-| Аудиокодек | AAC-LC, 192 kbps, 48 kHz, стерео |
-| Контейнер | MP4, оптимизирован для стриминга (`+faststart`) |
-| Нестандартное соотношение сторон | Размытый фон (boxblur) вместо чёрных полос |
-| Клипы без аудио | Заменяются тишиной автоматически |
-| Главы | Встраиваются в MP4 по каналу/посту/дате |
+| Параметр | Горизонтальный (default) | Вертикальный (`--orientation vertical`) |
+|---|---|---|
+| Разрешение | 1920×1080 (Full HD) | 1080×1920 (Full HD portrait) |
+| Видеокодек | H.264 High Profile, Level 4.1, CRF 23 | ← то же |
+| Аудиокодек | AAC-LC, 192 kbps, 48 kHz, стерео | ← то же |
+| Контейнер | MP4, оптимизирован для стриминга (`+faststart`) | ← то же |
+| Нестандартное соотношение сторон | Размытый фон (boxblur) | ← то же |
+| Клипы без аудио | Заменяются тишиной автоматически | ← то же |
+| Главы | Встраиваются в MP4 по каналу/посту/дате | ← то же |
 
 Рядом с выходным файлом создаётся `<output>.timestamps.txt` — список тайм-кодов для YouTube-описания.
 

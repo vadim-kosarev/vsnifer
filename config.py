@@ -91,6 +91,8 @@ class AdFilterConfig(BaseModel):
       ban_min_duration_sec — ban clips shorter than this many seconds (0 = off).
       ban_max_duration_sec — ban clips longer than this many seconds (0 = off).
       ban_max_file_size_mb — ban clips larger than this many megabytes (0 = off).
+      ban_require_text     — ban posts that have no text at all (text.txt absent
+                             or empty). false = off.
     """
 
     ban_text_contains: list[str] = []
@@ -100,6 +102,7 @@ class AdFilterConfig(BaseModel):
     ban_min_duration_sec: float = 0.0
     ban_max_duration_sec: float = 0.0
     ban_max_file_size_mb: float = 0.0
+    ban_require_text: bool = False
 
     model_config = {"extra": "allow"}
 

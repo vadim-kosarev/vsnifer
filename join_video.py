@@ -33,7 +33,7 @@ import os
 import re
 import subprocess
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -63,9 +63,20 @@ logger.debug(f"Logging level: {logging.getLevelName(_log_level)}, log file: {_lo
 # Video file extensions to collect
 VIDEO_EXTENSIONS: set[str] = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts"}
 
-# Output resolution
-OUTPUT_WIDTH = 1920
-OUTPUT_HEIGHT = 1080
+# Output resolution — horizontal (landscape) default
+OUTPUT_WIDTH_H = 1920
+OUTPUT_HEIGHT_H = 1080
+
+# Output resolution — vertical (portrait)
+OUTPUT_WIDTH_V = 1080
+OUTPUT_HEIGHT_V = 1920
+
+
+def output_dimensions(orientation: str) -> tuple[int, int]:
+    """Return (width, height) for the given orientation ('horizontal' or 'vertical')."""
+    if orientation == "vertical":
+        return OUTPUT_WIDTH_V, OUTPUT_HEIGHT_V
+    return OUTPUT_WIDTH_H, OUTPUT_HEIGHT_H
 
 
 class VideoInfo(BaseModel):
@@ -376,6 +387,7 @@ class PostContext(BaseModel):
     # Media properties
     file_size_bytes: Optional[int] = None   # from stat(), always filled
     duration_seconds: Optional[float] = None  # from ffprobe, None if not probed
+    has_text: bool = False                  # True when text.txt exists and is non-empty
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -420,6 +432,7 @@ def _load_post_context(
         text = (post_dir / "text.txt").read_text(encoding="utf-8")
     except Exception:
         pass
+    has_text: bool = bool(text.strip())
 
     post_date: Optional[datetime] = None
     date_str: str = meta.get("date", "")
@@ -462,6 +475,7 @@ def _load_post_context(
         channel_name=channel_name,
         post_id=meta.get("post_id"),
         text=text,
+        has_text=has_text,
         date=post_date,
         views=meta.get("views"),
         forwards=meta.get("forwards"),
@@ -612,6 +626,19 @@ def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
 
         rules.append(_rule_max_size)
 
+    # ------------------------------------------------------------------
+    # Rule: post has no text at all (text.txt missing or empty)
+    # .env.json → ad_filter.ban_require_text  (false = disabled)
+    # ------------------------------------------------------------------
+    if cfg.ban_require_text:
+
+        def _rule_require_text(ctx: PostContext) -> Optional[str]:
+            if not ctx.has_text:
+                return "post has no text (text.txt absent or empty)"
+            return None
+
+        rules.append(_rule_require_text)
+
     # ==================================================================
     # Custom code-level rules — add your own below this line.
     # Each rule must match the signature:
@@ -619,7 +646,7 @@ def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
     # Return None to pass, return a string reason to ban.
     #
     # Available ctx fields:
-    #   text, channel_name, post_id, date
+    #   text, has_text, channel_name, post_id, date
     #   views, forwards, replies, reactions_total, reactions
     #   has_media, media_type
     #   file_size_bytes, file_size_mb   (always populated)
@@ -862,7 +889,12 @@ def probe_video(ffprobe: Path, video: Path) -> Optional["VideoInfo"]:
     return VideoInfo(path=video, has_audio=has_audio, duration=duration)
 
 
-def build_filter_complex(videos_info: list[VideoInfo], audio_delay_ms: int = 0) -> str:
+def build_filter_complex(
+    videos_info: list[VideoInfo],
+    audio_delay_ms: int = 0,
+    out_width: int = OUTPUT_WIDTH_H,
+    out_height: int = OUTPUT_HEIGHT_H,
+) -> str:
     """
     Build a filter_complex string using the concat filter.
 
@@ -892,14 +924,14 @@ def build_filter_complex(videos_info: list[VideoInfo], audio_delay_ms: int = 0) 
         # --- Video: blurred background + sharp foreground overlay ---
         parts.append(f"[{i}:v]split=2[orig_bg{i}][orig_fg{i}]")
         parts.append(
-            f"[orig_bg{i}]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}"
+            f"[orig_bg{i}]scale={out_width}:{out_height}"
             f":force_original_aspect_ratio=increase,"
-            f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},"
+            f"crop={out_width}:{out_height},"
             f"boxblur=luma_radius=40:luma_power=3"
             f"[bg{i}]"
         )
         parts.append(
-            f"[orig_fg{i}]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}"
+            f"[orig_fg{i}]scale={out_width}:{out_height}"
             f":force_original_aspect_ratio=decrease"
             f"[fg{i}]"
         )
@@ -955,6 +987,8 @@ def build_filter_complex(videos_info: list[VideoInfo], audio_delay_ms: int = 0) 
 def run_ffmpeg(
     ffmpeg: Path, ffprobe: Path, videos: list[Path], output: Path, work_dir: Path,
     audio_delay_ms: int = 0,
+    out_width: int = OUTPUT_WIDTH_H,
+    out_height: int = OUTPUT_HEIGHT_H,
 ) -> None:
     """
     Probe all videos, build a concat-filter command, and encode to Full HD.
@@ -1003,7 +1037,10 @@ def run_ffmpeg(
         direction = "advance" if audio_delay_ms > 0 else "delay"
         logger.info(f"Audio sync correction: {direction} audio by {abs(audio_delay_ms)}ms")
 
-    filter_complex: str = build_filter_complex(videos_info, audio_delay_ms=audio_delay_ms)
+    filter_complex: str = build_filter_complex(
+        videos_info, audio_delay_ms=audio_delay_ms,
+        out_width=out_width, out_height=out_height,
+    )
 
     # Each video is a separate -i input
     inputs: list[str] = []
@@ -1083,6 +1120,18 @@ def run_ffmpeg(
     logger.info(f"Timestamps saved: {timestamps_path}")
 
 
+def _parse_last_days(value: str) -> int:
+    """Parse --last-days value: accept '7' or '7d', return int."""
+    v = value.strip().lower().rstrip("d")
+    try:
+        n = int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid --last-days value: {value!r}. Use a number like 7 or 7d.")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"--last-days must be >= 1, got {n}")
+    return n
+
+
 def main() -> None:
     default_work_dir: str = os.getenv("WORK_DIR", r"H:\TEMP\vk_vsf")
     default_audio_delay_ms: int = int(os.getenv("AUDIO_DELAY_MS", "0"))
@@ -1095,9 +1144,11 @@ Examples:
   python join_video.py --output result.mp4
   python join_video.py --work-dir H:\\TEMP\\vk_vsf\\babazoyka --output babazoyka_full.mp4
   python join_video.py --output result.mp4 --start-date 2025-11-01 --end-date 2025-11-30
+  python join_video.py --output result.mp4 --last-days 7
+  python join_video.py --output result.mp4 --last-days 7d
   python join_video.py --output result.mp4 --audio-delay-ms 200
   python join_video.py --output result.mp4 --sort interest-asc
-  python join_video.py --output result.mp4 --sort interest-desc --start-date 2026-01-01
+  python join_video.py --output result.mp4 --sort interest-desc --last-days 30
   python join_video.py --output result.mp4 --no-ad-filter
         """,
     )
@@ -1140,6 +1191,18 @@ Examples:
         help="Include only videos posted on or before this date (inclusive)",
     )
     parser.add_argument(
+        "--last-days",
+        type=_parse_last_days,
+        default=None,
+        metavar="N",
+        help=(
+            "Include only videos from the last N days (including today). "
+            "Accepts a plain integer or integer with 'd' suffix: 7 or 7d. "
+            "Equivalent to --start-date <today minus N-1 days>. "
+            "Overrides --start-date if both are given."
+        ),
+    )
+    parser.add_argument(
         "--audio-delay-ms",
         type=int,
         default=default_audio_delay_ms,
@@ -1160,11 +1223,22 @@ Examples:
             "(ad_filter section). Useful for debugging to see the full unfiltered list."
         ),
     )
+    parser.add_argument(
+        "--orientation",
+        choices=["horizontal", "vertical"],
+        default="horizontal",
+        help=(
+            "Output video orientation. "
+            "horizontal (default): 1920×1080 (landscape, YouTube/TV). "
+            "vertical: 1080×1920 (portrait, Reels/Shorts/TikTok)."
+        ),
+    )
 
     args = parser.parse_args()
     logger.debug(
         f"Parsed args: work_dir={args.work_dir!r}, output={args.output!r}, "
         f"sort={args.sort!r}, start_date={args.start_date}, end_date={args.end_date}, "
+        f"last_days={args.last_days}, orientation={args.orientation}, "
         f"audio_delay_ms={args.audio_delay_ms}, no_ad_filter={args.no_ad_filter}"
     )
 
@@ -1186,10 +1260,16 @@ Examples:
     if args.sort == "desc":
         videos = list(reversed(videos))
 
-    videos = filter_videos_by_date(videos, args.start_date, args.end_date)
-    if args.start_date or args.end_date:
+    # --last-days overrides --start-date
+    effective_start_date = args.start_date
+    if args.last_days is not None:
+        effective_start_date = date.today() - timedelta(days=args.last_days - 1)
+        logger.info(f"--last-days {args.last_days}: start date set to {effective_start_date}")
+
+    videos = filter_videos_by_date(videos, effective_start_date, args.end_date)
+    if effective_start_date or args.end_date:
         logger.info(
-            f"Date filter: [{args.start_date or '...'} — {args.end_date or '...'}] "
+            f"Date filter: [{effective_start_date or '...'} — {args.end_date or '...'}] "
             f"→ {len(videos)} video(s) after filtering"
         )
 
@@ -1257,7 +1337,15 @@ Examples:
             score_str = f"  interest={interest_scores[v]:.4f}"
         logger.info(f"  {v}{date_str}{score_str}")
 
-    run_ffmpeg(ffmpeg, ffprobe, videos, output, work_dir, audio_delay_ms=args.audio_delay_ms)
+    out_width, out_height = output_dimensions(args.orientation)
+    logger.info(f"Output orientation: {args.orientation} ({out_width}×{out_height})")
+
+    run_ffmpeg(
+        ffmpeg, ffprobe, videos, output, work_dir,
+        audio_delay_ms=args.audio_delay_ms,
+        out_width=out_width,
+        out_height=out_height,
+    )
 
 
 if __name__ == "__main__":
