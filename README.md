@@ -131,6 +131,7 @@ CHANNELS=@babazoyka, https://t.me/+otRtx2aMM0ZlMTVi, +HRom-yzU75JhYzIy
 #### Параметры join_video.py
 | Переменная | Описание | По умолчанию |
 |---|---|---|
+| `OUTPUT_DIR` | Каталог для выходного файла. Имя файла генерируется автоматически: `vk_vsf_output-YYYYMMDD.mp4` | `\\luigi\temp` |
 | `AUDIO_DELAY_MS` | Коррекция рассинхрона аудио в мс (>0 — аудио запаздывает; <0 — опережает; 0 — выкл.) | `0` |
 | `INTEREST_W_REACTIONS` | Вес реакций для interest-score | `10` |
 | `INTEREST_W_FORWARDS` | Вес форвардов | `5` |
@@ -181,6 +182,7 @@ CHANNELS=@babazoyka, https://t.me/+otRtx2aMM0ZlMTVi, +HRom-yzU75JhYzIy
 | `ban_min_duration_sec` | число | Бан если ролик короче N секунд (`0` = выкл.) |
 | `ban_max_duration_sec` | число | Бан если ролик длиннее N секунд (`0` = выкл.) |
 | `ban_max_file_size_mb` | число | Бан если файл тяжелее N МБ (`0` = выкл.) |
+| `ban_llm_ad_rate_threshold` | число 0.0–1.0 | Бан если `meta.json["ad_check"]["ad_rate"]` >= значения. Посты без `ad_check` не баним. `0.0` = выкл. По умолчанию `0.85` |
 
 Дополнительные правила на Python добавляются непосредственно в функцию `build_ban_rules()` в `join_video.py` — там есть секция с примерами.
 
@@ -305,7 +307,7 @@ python check_ad.py --log-level DEBUG update --limit 5
 | Параметр | Возможные значения | Умолчание |
 |---|---|---|
 | `--work-dir` | путь к каталогу | `WORK_DIR` из `.env` → `H:\TEMP\vk_vsf` |
-| `--output` | путь к файлу `.mp4` | **обязательный** |
+| `--output` | путь к файлу `.mp4` | `OUTPUT_DIR\vk_vsf_output-YYYYMMDD-<ориентация>[-<период>].mp4` |
 | `--sort` | `asc`, `desc`, `interest-asc`, `interest-desc` | `asc` |
 | `--start-date` | `YYYY-MM-DD` | не задано — без нижней границы |
 | `--end-date` | `YYYY-MM-DD` | не задано — без верхней границы |
@@ -313,6 +315,7 @@ python check_ad.py --log-level DEBUG update --limit 5
 | `--audio-delay-ms` | целое число в мс, положительное или отрицательное | `AUDIO_DELAY_MS` из `.env` → `0` |
 | `--orientation` | `horizontal`, `vertical` | `horizontal` (1920×1080) |
 | `--no-ad-filter` | флаг (без значения) | выкл. — фильтр рекламы активен |
+| `--ad-rate-threshold` | число 0.0–1.0 | `0.85` (из `.env.json` `ban_llm_ad_rate_threshold`) |
 
 ```powershell
 # Справка
@@ -347,6 +350,9 @@ python join_video.py --output result.mp4 --audio-delay-ms 200
 
 # Отключить фильтр рекламы (показать все ролики без исключений)
 python join_video.py --output result.mp4 --no-ad-filter
+
+# Использовать строгий порог для LLM-классификации (исключать при ad_rate >= 0.7)
+python join_video.py --output result.mp4 --ad-rate-threshold 0.7
 
 # Вертикальное видео (Reels / Shorts / TikTok) — 1080×1920
 python join_video.py --output result_vertical.mp4 --orientation vertical

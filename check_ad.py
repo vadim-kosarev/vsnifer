@@ -69,6 +69,7 @@ class PostToCheck(BaseModel):
 
     meta_path  -- absolute path to the post's meta.json (for writing results back)
     content    -- text from text.txt (sent to LLM)
+    date       -- post publication date (ISO-8601) from meta.json, used for sorting
     """
 
     id: str          # "channel/post_id"
@@ -76,6 +77,7 @@ class PostToCheck(BaseModel):
     post_id: int
     meta_path: Path
     content: str
+    date: Optional[str] = None   # ISO-8601; None when meta.json has no 'date' field
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -118,7 +120,7 @@ def collect_posts_to_check(
 
     Skips posts whose meta.json already contains 'ad_check' unless force=True.
     If channel_filter is given, only that channel subdirectory is scanned.
-    Returns posts sorted by (channel, post_id) ascending.
+    Returns posts sorted by date descending (newest first), post_id descending as tiebreaker.
     """
     posts: list[PostToCheck] = []
 
@@ -149,15 +151,16 @@ def collect_posts_to_check(
                 logger.debug(f"[{channel_name}/{post_id}] no text.txt, skipping")
                 continue
 
-            if not force:
-                try:
-                    meta: dict = json.loads(meta_path.read_text(encoding="utf-8"))
-                    if "ad_check" in meta:
-                        logger.debug(f"[{channel_name}/{post_id}] already checked, skipping")
-                        continue
-                except Exception as exc:
-                    logger.warning(f"[{channel_name}/{post_id}] failed to read meta.json: {exc}")
+            date_str: Optional[str] = None
+            try:
+                meta: dict = json.loads(meta_path.read_text(encoding="utf-8"))
+                date_str = meta.get("date")
+                if not force and "ad_check" in meta:
+                    logger.debug(f"[{channel_name}/{post_id}] already checked, skipping")
                     continue
+            except Exception as exc:
+                logger.warning(f"[{channel_name}/{post_id}] failed to read meta.json: {exc}")
+                continue
 
             try:
                 content: str = text_path.read_text(encoding="utf-8").strip()
@@ -176,9 +179,16 @@ def collect_posts_to_check(
                     post_id=post_id,
                     meta_path=meta_path,
                     content=content,
+                    date=date_str,
                 )
             )
             logger.debug(f"[{channel_name}/{post_id}] queued ({len(content)} chars)")
+
+    # Newest first: sort by date desc, then post_id desc as tiebreaker
+    posts.sort(
+        key=lambda p: (p.date or "", p.post_id),
+        reverse=True,
+    )
 
     logger.info(f"Found {len(posts)} post(s) to classify in {work_dir}")
     return posts

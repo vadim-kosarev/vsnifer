@@ -103,6 +103,10 @@ class AdFilterConfig(BaseModel):
     ban_max_duration_sec: float = 0.0
     ban_max_file_size_mb: float = 0.0
     ban_require_text: bool = False
+    # Ban posts whose LLM ad_check.ad_rate >= this threshold (0.0 = disabled).
+    # Populated by check_ad.py update; posts without ad_check are never banned
+    # by this rule regardless of the threshold.
+    ban_llm_ad_rate_threshold: float = 0.85
 
     model_config = {"extra": "allow"}
 

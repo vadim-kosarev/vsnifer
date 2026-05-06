@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -388,6 +389,8 @@ class PostContext(BaseModel):
     file_size_bytes: Optional[int] = None   # from stat(), always filled
     duration_seconds: Optional[float] = None  # from ffprobe, None if not probed
     has_text: bool = False                  # True when text.txt exists and is non-empty
+    # LLM ad classification result (from meta.json["ad_check"], None if not yet checked)
+    ad_rate: Optional[float] = None
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -486,6 +489,7 @@ def _load_post_context(
         media_type=meta.get("media_type"),
         file_size_bytes=file_size_bytes,
         duration_seconds=duration_seconds,
+        ad_rate=meta.get("ad_check", {}).get("ad_rate") if isinstance(meta.get("ad_check"), dict) else None,
     )
 
 
@@ -651,6 +655,7 @@ def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
     #   has_media, media_type
     #   file_size_bytes, file_size_mb   (always populated)
     #   duration_seconds                (populated when ffprobe passed)
+    #   ad_rate                         (from meta.json["ad_check"]["ad_rate"], None if not checked)
     # ==================================================================
 
     # Example: ban very short clips (likely teasers / reposts).
@@ -688,6 +693,24 @@ def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
     #             return f"suspicious reaction ratio {ratio:.2f}"
     #     return None
     # rules.append(_rule_reaction_ratio)
+
+    # ------------------------------------------------------------------
+    # Rule: LLM ad classification — ban if ad_check.ad_rate >= threshold
+    # .env.json → ad_filter.ban_llm_ad_rate_threshold  (default: 0.85)
+    # Posts without ad_check in meta.json are never banned by this rule.
+    # Set threshold to 0.0 in .env.json to disable.
+    # ------------------------------------------------------------------
+    if cfg.ban_llm_ad_rate_threshold and cfg.ban_llm_ad_rate_threshold > 0.0:
+        _threshold: float = cfg.ban_llm_ad_rate_threshold
+
+        def _rule_llm_ad_rate(
+            ctx: PostContext, threshold: float = _threshold
+        ) -> Optional[str]:
+            if ctx.ad_rate is not None and ctx.ad_rate >= threshold:
+                return f"LLM ad_rate={ctx.ad_rate:.2f} >= threshold {threshold:.2f}"
+            return None
+
+        rules.append(_rule_llm_ad_rate)
 
     return rules
 
@@ -1132,9 +1155,45 @@ def _parse_last_days(value: str) -> int:
     return n
 
 
+def _build_default_output(
+    output_dir: str,
+    orientation: str,
+    last_days: Optional[int],
+    start_date: Optional["date"],
+    end_date: Optional["date"],
+) -> str:
+    """
+    Build the default output filename from orientation and active date filter.
+
+    Examples:
+      horizontal, no filter   → vk_vsf_output-20260506-horizontal.mp4
+      vertical,   last 7 days → vk_vsf_output-20260506-vertical-last7d.mp4
+      horizontal, date range  → vk_vsf_output-20260506-horizontal-20260101-20260430.mp4
+      horizontal, from only   → vk_vsf_output-20260506-horizontal-from20260101.mp4
+      horizontal, till only   → vk_vsf_output-20260506-horizontal-till20260430.mp4
+    """
+    parts: list[str] = [
+        "vk_vsf_output",
+        date.today().strftime("%Y%m%d"),
+        orientation,
+    ]
+
+    if last_days is not None:
+        parts.append(f"last{last_days}d")
+    elif start_date and end_date:
+        parts.append(f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}")
+    elif start_date:
+        parts.append(f"from{start_date.strftime('%Y%m%d')}")
+    elif end_date:
+        parts.append(f"till{end_date.strftime('%Y%m%d')}")
+
+    return str(Path(output_dir) / ("-".join(parts) + ".mp4"))
+
+
 def main() -> None:
     default_work_dir: str = os.getenv("WORK_DIR", r"H:\TEMP\vk_vsf")
     default_audio_delay_ms: int = int(os.getenv("AUDIO_DELAY_MS", "0"))
+    _output_dir: str = os.getenv("OUTPUT_DIR", r"\\luigi\temp")
 
     parser = argparse.ArgumentParser(
         description="Concatenate downloaded channel videos into one Full HD file",
@@ -1161,8 +1220,12 @@ Examples:
     parser.add_argument(
         "--output",
         type=str,
-        required=True,
-        help="Output video file path (e.g. result.mp4)",
+        default=None,
+        help=(
+            "Output video file path. "
+            f"Default: OUTPUT_DIR/vk_vsf_output-YYYYMMDD-<orientation>[-<period>].mp4 "
+            f"(OUTPUT_DIR from .env: {_output_dir})"
+        ),
     )
     parser.add_argument(
         "--sort",
@@ -1224,6 +1287,19 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--ad-rate-threshold",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help=(
+            "Override the LLM ad_rate ban threshold (0.0–1.0). "
+            "Posts with ad_check.ad_rate >= this value are excluded. "
+            "Posts without ad_check are never excluded by this rule. "
+            "Default: ban_llm_ad_rate_threshold from .env.json (0.85 if not set). "
+            "Set to 0.0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--orientation",
         choices=["horizontal", "vertical"],
         default="horizontal",
@@ -1234,12 +1310,29 @@ Examples:
         ),
     )
 
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
     args = parser.parse_args()
+
+    # Build default output path now that orientation and date filters are known
+    if args.output is None:
+        args.output = _build_default_output(
+            _output_dir,
+            args.orientation,
+            args.last_days,
+            args.start_date,
+            args.end_date,
+        )
+        logger.info(f"Output (auto): {args.output}")
+
     logger.debug(
         f"Parsed args: work_dir={args.work_dir!r}, output={args.output!r}, "
         f"sort={args.sort!r}, start_date={args.start_date}, end_date={args.end_date}, "
         f"last_days={args.last_days}, orientation={args.orientation}, "
-        f"audio_delay_ms={args.audio_delay_ms}, no_ad_filter={args.no_ad_filter}"
+        f"audio_delay_ms={args.audio_delay_ms}, no_ad_filter={args.no_ad_filter}, "
+        f"ad_rate_threshold={args.ad_rate_threshold}"
     )
 
     work_dir = Path(args.work_dir)
@@ -1280,6 +1373,11 @@ Examples:
     # Ad / spam filter
     if not args.no_ad_filter:
         app_config = load_app_config()
+        # CLI --ad-rate-threshold overrides the value from .env.json
+        if args.ad_rate_threshold is not None:
+            app_config.ad_filter = app_config.ad_filter.model_copy(
+                update={"ban_llm_ad_rate_threshold": args.ad_rate_threshold}
+            )
         ban_rules = build_ban_rules(app_config.ad_filter)
         if ban_rules:
             needs_duration = (
