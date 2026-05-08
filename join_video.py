@@ -30,6 +30,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -228,8 +229,16 @@ def build_chapters_metadata(videos_info: list["VideoInfo"]) -> str:
         lines.append("TIMEBASE=1/1000")
         lines.append(f"START={start_ms}")
         lines.append(f"END={end_ms}")
-        # escape '=' and ';' which are special in ffmetadata values
-        safe_title: str = info.chapter_title.replace("=", "\\=").replace(";", "\\;")
+        # escape special ffmetadata characters: \, =, ;, #, and newlines
+        safe_title: str = (
+            info.chapter_title
+            .replace("\\", "\\\\")
+            .replace("=", "\\=")
+            .replace(";", "\\;")
+            .replace("#", "\\#")
+            .replace("\n", "\\\n")
+            .replace("\r", "")
+        )
         lines.append(f"title={safe_title}")
         offset_ms = end_ms
     return "\n".join(lines) + "\n"
@@ -1104,9 +1113,13 @@ def run_ffmpeg(
             "-map", "[aout]",
             "-map_metadata", str(metadata_input_index),  # embed chapters
             # Video: H.264 web-compatible
+            # Level 5.1: supports 1080×1920 with up to 16 ref frames.
+            # Level 4.1 caps DPB to 4 refs at 1080p — libx264 with
+            # preset=medium exceeds this, causing strict decoders (NAS,
+            # hardware players) to refuse playback.
             "-c:v", "libx264",
             "-profile:v", "high",
-            "-level:v", "4.1",
+            "-level:v", "5.1",
             "-pix_fmt", "yuv420p",
             "-crf", "23",
             "-preset", "medium",
@@ -1209,6 +1222,7 @@ Examples:
   python join_video.py --output result.mp4 --sort interest-asc
   python join_video.py --output result.mp4 --sort interest-desc --last-days 30
   python join_video.py --output result.mp4 --no-ad-filter
+  python join_video.py --limit 10 --output test.mp4
         """,
     )
     parser.add_argument(
@@ -1309,6 +1323,17 @@ Examples:
             "vertical: 1080×1920 (portrait, Reels/Shorts/TikTok)."
         ),
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Pick N random videos from the filtered+sorted set. "
+            "The selected videos keep the original sort order. "
+            "Useful for testing the result without processing the full set."
+        ),
+    )
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -1330,10 +1355,57 @@ Examples:
     logger.debug(
         f"Parsed args: work_dir={args.work_dir!r}, output={args.output!r}, "
         f"sort={args.sort!r}, start_date={args.start_date}, end_date={args.end_date}, "
-        f"last_days={args.last_days}, orientation={args.orientation}, "
+        f"last_days={args.last_days}, orientation={args.orientation}, limit={args.limit}, "
         f"audio_delay_ms={args.audio_delay_ms}, no_ad_filter={args.no_ad_filter}, "
         f"ad_rate_threshold={args.ad_rate_threshold}"
     )
+
+    # -----------------------------------------------------------------------
+    # Startup summary — printed before any heavy work so the user can
+    # verify the run parameters and abort early if something looks wrong.
+    # -----------------------------------------------------------------------
+    _ad_rate_thr = args.ad_rate_threshold if args.ad_rate_threshold is not None else 0.85
+    _date_filter: str
+    if args.last_days is not None:
+        _date_filter = f"last {args.last_days} day(s)"
+    elif args.start_date and args.end_date:
+        _date_filter = f"{args.start_date} — {args.end_date}"
+    elif args.start_date:
+        _date_filter = f"from {args.start_date}"
+    elif args.end_date:
+        _date_filter = f"until {args.end_date}"
+    else:
+        _date_filter = "all"
+
+    _ad_filter_str: str
+    if args.no_ad_filter:
+        _ad_filter_str = "DISABLED (--no-ad-filter)"
+    else:
+        _thr = f"ad_rate >= {_ad_rate_thr}"
+        _ad_filter_str = f"ON  (ban if {_thr})"
+
+    _limit_str = str(args.limit) + " random" if args.limit is not None else "all"
+    _out_w, _out_h = output_dimensions(args.orientation)
+
+    summary_lines = [
+        "",
+        "=" * 60,
+        "  join_video  —  run summary",
+        "=" * 60,
+        f"  Work dir      : {args.work_dir}",
+        f"  Output        : {args.output}",
+        f"  Orientation   : {args.orientation}  ({_out_w}×{_out_h})",
+        f"  Sort          : {args.sort}",
+        f"  Date filter   : {_date_filter}",
+        f"  Video limit   : {_limit_str}",
+        f"  Ad filter     : {_ad_filter_str}",
+        f"  Audio delay   : {args.audio_delay_ms} ms"
+        + (" (disabled)" if args.audio_delay_ms == 0 else ""),
+        "=" * 60,
+        "",
+    ]
+    for line in summary_lines:
+        logger.info(line)
 
     work_dir = Path(args.work_dir)
     output = Path(args.output)
@@ -1416,6 +1488,17 @@ Examples:
         )
 
     logger.info(f"Found {len(videos)} video file(s)")
+
+    # --limit: pick N random videos, preserving the original sort order
+    if args.limit is not None:
+        if args.limit < 1:
+            logger.error("--limit must be >= 1")
+            raise SystemExit(1)
+        if args.limit < len(videos):
+            chosen = sorted(random.sample(range(len(videos)), args.limit))
+            videos = [videos[i] for i in chosen]
+            logger.info(f"--limit {args.limit}: randomly selected {len(videos)} of the filtered set")
+
     for v in videos:
         meta_file = v.parent / "meta.json"
         date_str = ""
