@@ -317,6 +317,8 @@ python check_ad.py --log-level DEBUG update --limit 5
 | `--orientation` | `horizontal`, `vertical` | `horizontal` (1920×1080) |
 | `--no-ad-filter` | флаг (без значения) | выкл. — фильтр рекламы активен |
 | `--ad-rate-threshold` | число 0.0–1.0 | `0.85` (из `.env.json` `ban_llm_ad_rate_threshold`) |
+| `--nude-rate-threshold` | число 0.0–1.0 | `0.65` (из `.env` `NUDE_RATE_THRESHOLD`) |
+| `--limit` | целое число ≥ 1 | не задано — берутся все ролики. Случайно выбирает N роликов из отфильтрованного набора, сохраняя порядок сортировки. |
 
 ```powershell
 # Справка (также выводится при запуске без аргументов: python join_video.py)
@@ -364,6 +366,12 @@ python join_video.py --output result_vertical.mp4 --orientation vertical --last-
 # Несколько опций вместе
 python join_video.py --output result.mp4 --sort interest-asc --last-days 7 --audio-delay-ms 250
 python join_video.py --output result.mp4 --sort interest-asc --start-date 2026-01-01 --audio-delay-ms 250
+
+# Случайная выборка: взять 20 случайных роликов из всего набора
+python join_video.py --output result.mp4 --limit 20
+
+# Случайная выборка из отфильтрованного набора (за 7 дней, без рекламы, по интересности)
+python join_video.py --output result.mp4 --limit 15 --last-days 7 --sort interest-asc
 ```
 
 #### Фильтрация по дате
