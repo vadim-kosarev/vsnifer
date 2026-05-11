@@ -4,4 +4,7 @@ pydantic==2.5.3
 python-socks==2.5.3
 TelethonFakeTLS
 requests>=2.31.0
+fastmcp>=2.0
+nudenet>=3.4
+opencv-python>=4.0
 

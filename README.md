@@ -469,5 +469,80 @@ WORK_DIR/
 | `logs/vk_vsf_bot.log` | `vk_vsf_bot.py` |
 | `logs/join_video.log` | `join_video.py` |
 | `logs/check_ad.log` | `check_ad.py` |
+| `logs/mcp_server.log` | `mcp_server.py` |
 
 Уровень задаётся через `LOG_LEVEL` в `.env`. Логи пишутся одновременно в файл и в консоль.
+
+---
+
+## MCP-сервер (`mcp_server.py`)
+
+FastMCP HTTP-сервер, предоставляющий AI-агентам инструменты для чтения и классификации постов.
+
+```powershell
+# Запуск
+python mcp_server.py run
+
+# Список инструментов
+python mcp_server.py list-tools
+```
+
+Endpoint: `http://localhost:3100/mcp`  
+Переменные окружения: `MCP_HOST`, `MCP_PORT` (см. `.env`).
+
+### Тестирование через PowerShell (curl)
+
+Сервер работает в режиме **stateless + json_response** — session ID не нужен, каждый запрос независим, ответ возвращается как обычный JSON (не SSE-стрим).
+
+#### Функция-обёртка для вызова инструментов
+
+```powershell
+function Invoke-McpTool {
+    param(
+        [string]$Tool,
+        [hashtable]$Params = @{}   # NB: не $Args — это зарезервированная переменная PS
+    )
+    $body = @{
+        jsonrpc = "2.0"
+        id      = 1
+        method  = "tools/call"
+        params  = @{
+            name      = $Tool
+            arguments = $Params
+        }
+    } | ConvertTo-Json -Depth 10
+
+    curl.exe -s -X POST http://localhost:3100/mcp `
+      -H "Content-Type: application/json" `
+      -H "Accept: application/json" `
+      -d $body
+}
+```
+
+#### Примеры вызовов
+
+```powershell
+# Список каналов
+Invoke-McpTool -Tool "list_channels"
+
+# Статистика по каналу
+Invoke-McpTool -Tool "get_stats" -Params @{ channel = "babazoyka" }
+
+# Следующий батч непроверенных постов (все каналы, 3 поста)
+Invoke-McpTool -Tool "get_unchecked_batch" -Params @{ batch_size = 3 }
+
+# Непроверенные посты конкретного канала
+Invoke-McpTool -Tool "get_unchecked_batch" -Params @{ channel = "babazoyka"; batch_size = 5 }
+
+# Посты по списку ID
+Invoke-McpTool -Tool "get_posts" -Params @{ channel = "babazoyka"; ids = @("23609", "23610") }
+
+# Список инструментов через JSON-RPC
+curl.exe -s -X POST http://localhost:3100/mcp `
+  -H "Content-Type: application/json" `
+  -H "Accept: application/json" `
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+> ⚠️ При переключении сервера обратно в stateful-режим (без `stateless_http=True`) потребуется снова добавить шаг инициализации сессии и заголовок `Mcp-Session-Id`.
+

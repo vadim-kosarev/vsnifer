@@ -400,6 +400,8 @@ class PostContext(BaseModel):
     has_text: bool = False                  # True when text.txt exists and is non-empty
     # LLM ad classification result (from meta.json["ad_check"], None if not yet checked)
     ad_rate: Optional[float] = None
+    # Nudity detection score (from meta.json["nude_check"]["nude_rate"], None if not run)
+    nude_rate: Optional[float] = None
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -499,6 +501,7 @@ def _load_post_context(
         file_size_bytes=file_size_bytes,
         duration_seconds=duration_seconds,
         ad_rate=meta.get("ad_check", {}).get("ad_rate") if isinstance(meta.get("ad_check"), dict) else None,
+        nude_rate=meta.get("nude_check", {}).get("nude_rate") if isinstance(meta.get("nude_check"), dict) else None,
     )
 
 
@@ -720,6 +723,25 @@ def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
             return None
 
         rules.append(_rule_llm_ad_rate)
+
+    # ------------------------------------------------------------------
+    # Rule: nudity score — ban if nude_check.nude_rate >= threshold
+    # .env NUDE_RATE_THRESHOLD / .env.json → ad_filter.ban_nude_rate_threshold
+    # (default: 0.5)
+    # Posts without nude_check in meta.json are never banned by this rule.
+    # Set threshold to 0.0 to disable.
+    # ------------------------------------------------------------------
+    if cfg.ban_nude_rate_threshold and cfg.ban_nude_rate_threshold > 0.0:
+        _nude_threshold: float = cfg.ban_nude_rate_threshold
+
+        def _rule_nude_rate(
+            ctx: PostContext, threshold: float = _nude_threshold
+        ) -> Optional[str]:
+            if ctx.nude_rate is not None and ctx.nude_rate >= threshold:
+                return f"nude_rate={ctx.nude_rate:.4f} >= threshold {threshold:.2f}"
+            return None
+
+        rules.append(_rule_nude_rate)
 
     return rules
 
@@ -1157,14 +1179,14 @@ def run_ffmpeg(
 
 
 def _parse_last_days(value: str) -> int:
-    """Parse --last-days value: accept '7' or '7d', return int."""
+    """Parse --last-days / --last-full-days value: accept '7' or '7d', return int."""
     v = value.strip().lower().rstrip("d")
     try:
         n = int(v)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"Invalid --last-days value: {value!r}. Use a number like 7 or 7d.")
+        raise argparse.ArgumentTypeError(f"Invalid value: {value!r}. Use a number like 7 or 7d.")
     if n < 1:
-        raise argparse.ArgumentTypeError(f"--last-days must be >= 1, got {n}")
+        raise argparse.ArgumentTypeError(f"Value must be >= 1, got {n}")
     return n
 
 
@@ -1172,6 +1194,7 @@ def _build_default_output(
     output_dir: str,
     orientation: str,
     last_days: Optional[int],
+    last_full_days: Optional[int],
     start_date: Optional["date"],
     end_date: Optional["date"],
 ) -> str:
@@ -1179,11 +1202,12 @@ def _build_default_output(
     Build the default output filename from orientation and active date filter.
 
     Examples:
-      horizontal, no filter   → vk_vsf_output-20260506-horizontal.mp4
-      vertical,   last 7 days → vk_vsf_output-20260506-vertical-last7d.mp4
-      horizontal, date range  → vk_vsf_output-20260506-horizontal-20260101-20260430.mp4
-      horizontal, from only   → vk_vsf_output-20260506-horizontal-from20260101.mp4
-      horizontal, till only   → vk_vsf_output-20260506-horizontal-till20260430.mp4
+      horizontal, no filter        → vk_vsf_output-20260506-horizontal.mp4
+      vertical,   last 7 days      → vk_vsf_output-20260506-vertical-last7d.mp4
+      vertical,   last-full 7 days → vk_vsf_output-20260506-vertical-lastfull7d.mp4
+      horizontal, date range       → vk_vsf_output-20260506-horizontal-20260101-20260430.mp4
+      horizontal, from only        → vk_vsf_output-20260506-horizontal-from20260101.mp4
+      horizontal, till only        → vk_vsf_output-20260506-horizontal-till20260430.mp4
     """
     parts: list[str] = [
         "vk_vsf_output",
@@ -1193,6 +1217,8 @@ def _build_default_output(
 
     if last_days is not None:
         parts.append(f"last{last_days}d")
+    elif last_full_days is not None:
+        parts.append(f"lastfull{last_full_days}d")
     elif start_date and end_date:
         parts.append(f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}")
     elif start_date:
@@ -1207,6 +1233,7 @@ def main() -> None:
     default_work_dir: str = os.getenv("WORK_DIR", r"H:\TEMP\vk_vsf")
     default_audio_delay_ms: int = int(os.getenv("AUDIO_DELAY_MS", "0"))
     _output_dir: str = os.getenv("OUTPUT_DIR", r"\\luigi\temp")
+    _default_nude_rate_threshold: float = float(os.getenv("NUDE_RATE_THRESHOLD", "0.5"))
 
     parser = argparse.ArgumentParser(
         description="Concatenate downloaded channel videos into one Full HD file",
@@ -1218,6 +1245,7 @@ Examples:
   python join_video.py --output result.mp4 --start-date 2025-11-01 --end-date 2025-11-30
   python join_video.py --output result.mp4 --last-days 7
   python join_video.py --output result.mp4 --last-days 7d
+  python join_video.py --output result.mp4 --last-full-days 7
   python join_video.py --output result.mp4 --audio-delay-ms 200
   python join_video.py --output result.mp4 --sort interest-asc
   python join_video.py --output result.mp4 --sort interest-desc --last-days 30
@@ -1280,6 +1308,18 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--last-full-days",
+        type=_parse_last_days,
+        default=None,
+        metavar="N",
+        help=(
+            "Include only videos from the last N fully completed days "
+            "(yesterday and earlier, today excluded). "
+            "Equivalent to --start-date <today minus N days> --end-date <yesterday>. "
+            "Overrides --start-date and --end-date if both are given."
+        ),
+    )
+    parser.add_argument(
         "--audio-delay-ms",
         type=int,
         default=default_audio_delay_ms,
@@ -1310,6 +1350,19 @@ Examples:
             "Posts with ad_check.ad_rate >= this value are excluded. "
             "Posts without ad_check are never excluded by this rule. "
             "Default: ban_llm_ad_rate_threshold from .env.json (0.85 if not set). "
+            "Set to 0.0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--nude-rate-threshold",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help=(
+            "Override the nudity ban threshold (0.0–1.0). "
+            "Video posts with nude_check.nude_rate >= this value are excluded. "
+            "Posts without nude_check are never excluded by this rule. "
+            f"Default: NUDE_RATE_THRESHOLD from .env ({_default_nude_rate_threshold}). "
             "Set to 0.0 to disable."
         ),
     )
@@ -1347,6 +1400,7 @@ Examples:
             _output_dir,
             args.orientation,
             args.last_days,
+            args.last_full_days,
             args.start_date,
             args.end_date,
         )
@@ -1355,9 +1409,11 @@ Examples:
     logger.debug(
         f"Parsed args: work_dir={args.work_dir!r}, output={args.output!r}, "
         f"sort={args.sort!r}, start_date={args.start_date}, end_date={args.end_date}, "
-        f"last_days={args.last_days}, orientation={args.orientation}, limit={args.limit}, "
+        f"last_days={args.last_days}, last_full_days={args.last_full_days}, "
+        f"orientation={args.orientation}, limit={args.limit}, "
         f"audio_delay_ms={args.audio_delay_ms}, no_ad_filter={args.no_ad_filter}, "
-        f"ad_rate_threshold={args.ad_rate_threshold}"
+        f"ad_rate_threshold={args.ad_rate_threshold}, "
+        f"nude_rate_threshold={args.nude_rate_threshold}"
     )
 
     # -----------------------------------------------------------------------
@@ -1365,9 +1421,14 @@ Examples:
     # verify the run parameters and abort early if something looks wrong.
     # -----------------------------------------------------------------------
     _ad_rate_thr = args.ad_rate_threshold if args.ad_rate_threshold is not None else 0.85
+    _nude_rate_thr = args.nude_rate_threshold if args.nude_rate_threshold is not None else _default_nude_rate_threshold
     _date_filter: str
     if args.last_days is not None:
-        _date_filter = f"last {args.last_days} day(s)"
+        _date_filter = f"last {args.last_days} day(s)  (incl. today)"
+    elif args.last_full_days is not None:
+        _yesterday = date.today() - timedelta(days=1)
+        _lfd_start = date.today() - timedelta(days=args.last_full_days)
+        _date_filter = f"last {args.last_full_days} full day(s)  ({_lfd_start} — {_yesterday})"
     elif args.start_date and args.end_date:
         _date_filter = f"{args.start_date} — {args.end_date}"
     elif args.start_date:
@@ -1382,7 +1443,8 @@ Examples:
         _ad_filter_str = "DISABLED (--no-ad-filter)"
     else:
         _thr = f"ad_rate >= {_ad_rate_thr}"
-        _ad_filter_str = f"ON  (ban if {_thr})"
+        _nude_thr = f"nude_rate >= {_nude_rate_thr}"
+        _ad_filter_str = f"ON  (ban if {_thr} | {_nude_thr})"
 
     _limit_str = str(args.limit) + " random" if args.limit is not None else "all"
     _out_w, _out_h = output_dimensions(args.orientation)
@@ -1427,14 +1489,22 @@ Examples:
 
     # --last-days overrides --start-date
     effective_start_date = args.start_date
+    effective_end_date = args.end_date
     if args.last_days is not None:
         effective_start_date = date.today() - timedelta(days=args.last_days - 1)
         logger.info(f"--last-days {args.last_days}: start date set to {effective_start_date}")
-
-    videos = filter_videos_by_date(videos, effective_start_date, args.end_date)
-    if effective_start_date or args.end_date:
+    elif args.last_full_days is not None:
+        effective_start_date = date.today() - timedelta(days=args.last_full_days)
+        effective_end_date = date.today() - timedelta(days=1)
         logger.info(
-            f"Date filter: [{effective_start_date or '...'} — {args.end_date or '...'}] "
+            f"--last-full-days {args.last_full_days}: "
+            f"date range set to {effective_start_date} — {effective_end_date}"
+        )
+
+    videos = filter_videos_by_date(videos, effective_start_date, effective_end_date)
+    if effective_start_date or effective_end_date:
+        logger.info(
+            f"Date filter: [{effective_start_date or '...'} — {effective_end_date or '...'}] "
             f"→ {len(videos)} video(s) after filtering"
         )
 
@@ -1450,6 +1520,15 @@ Examples:
             app_config.ad_filter = app_config.ad_filter.model_copy(
                 update={"ban_llm_ad_rate_threshold": args.ad_rate_threshold}
             )
+        # .env NUDE_RATE_THRESHOLD and CLI --nude-rate-threshold override .env.json default
+        _effective_nude_threshold = (
+            args.nude_rate_threshold
+            if args.nude_rate_threshold is not None
+            else _default_nude_rate_threshold
+        )
+        app_config.ad_filter = app_config.ad_filter.model_copy(
+            update={"ban_nude_rate_threshold": _effective_nude_threshold}
+        )
         ban_rules = build_ban_rules(app_config.ad_filter)
         if ban_rules:
             needs_duration = (

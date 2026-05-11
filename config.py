@@ -83,16 +83,21 @@ class AdFilterConfig(BaseModel):
     the corresponding rule group.
 
     Fields:
-      ban_text_contains    — ban if post text contains any of these substrings.
-      ban_text_regex       — ban if post text matches any of these regexes.
-      ban_channel_mentions — ban if post text mentions any of these @channels
-                             or t.me/<channel> links.
-      ban_min_views        — ban posts with fewer views than this value (0 = off).
-      ban_min_duration_sec — ban clips shorter than this many seconds (0 = off).
-      ban_max_duration_sec — ban clips longer than this many seconds (0 = off).
-      ban_max_file_size_mb — ban clips larger than this many megabytes (0 = off).
-      ban_require_text     — ban posts that have no text at all (text.txt absent
-                             or empty). false = off.
+      ban_text_contains       — ban if post text contains any of these substrings.
+      ban_text_regex          — ban if post text matches any of these regexes.
+      ban_channel_mentions    — ban if post text mentions any of these @channels
+                                or t.me/<channel> links.
+      ban_min_views           — ban posts with fewer views than this value (0 = off).
+      ban_min_duration_sec    — ban clips shorter than this many seconds (0 = off).
+      ban_max_duration_sec    — ban clips longer than this many seconds (0 = off).
+      ban_max_file_size_mb    — ban clips larger than this many megabytes (0 = off).
+      ban_require_text        — ban posts that have no text at all (text.txt absent
+                                or empty). false = off.
+      ban_llm_ad_rate_threshold  — ban posts whose ad_check.ad_rate >= threshold
+                                   (0.0 = disabled). Default 0.85.
+      ban_nude_rate_threshold — ban video posts whose nude_check.nude_rate >= threshold
+                                (0.0 = disabled). Default 0.5. Override via .env
+                                NUDE_RATE_THRESHOLD or CLI --nude-rate-threshold.
     """
 
     ban_text_contains: list[str] = []
@@ -107,6 +112,11 @@ class AdFilterConfig(BaseModel):
     # Populated by check_ad.py update; posts without ad_check are never banned
     # by this rule regardless of the threshold.
     ban_llm_ad_rate_threshold: float = 0.85
+    # Ban video posts whose nude_check.nude_rate >= this threshold (0.0 = disabled).
+    # Populated by check_ad.py update-nudes; posts without nude_check are never
+    # banned by this rule.  Override via .env NUDE_RATE_THRESHOLD or
+    # CLI --nude-rate-threshold.
+    ban_nude_rate_threshold: float = 0.5
 
     model_config = {"extra": "allow"}
 

@@ -12,7 +12,8 @@ classifies them in batches using a local Ollama LLM, and writes the result back:
     }
 
 Commands:
-  update   Scan WORK_DIR, classify unchecked posts in batches, update meta.json.
+  update         Scan WORK_DIR, classify unchecked posts in batches, update meta.json.
+  update-nudes   Scan WORK_DIR for video posts, compute nude_rate with NudeDetector.
 
 Usage:
     python check_ad.py
@@ -25,6 +26,9 @@ Usage:
     python check_ad.py update --channel babazoyka
     python check_ad.py update --limit 20
     python check_ad.py --log-level DEBUG update
+    python check_ad.py update-nudes
+    python check_ad.py update-nudes --frames 15 --channel babazoyka
+    python check_ad.py update-nudes --force --dry-run
 """
 
 import argparse
@@ -470,6 +474,240 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Nudity detection constants
+# ---------------------------------------------------------------------------
+
+#: nudenet 3.x: classes considered explicitly nude (high-confidence nudity signal)
+_NUDE_EXPLICIT_CLASSES: frozenset[str] = frozenset({
+    "FEMALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "ANUS_EXPOSED",
+    "BUTTOCKS_EXPOSED",
+})
+
+#: Video file extensions to scan in post directories
+_VIDEO_EXTENSIONS: frozenset[str] = frozenset({
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv",
+})
+
+
+# ---------------------------------------------------------------------------
+# Nudity detection helpers
+# ---------------------------------------------------------------------------
+
+def _find_video_file(post_dir: Path) -> Optional[Path]:
+    """Return the first video file found in a post directory, or None."""
+    for f in post_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in _VIDEO_EXTENSIONS:
+            return f
+    return None
+
+
+def _extract_frames(video_path: Path, max_frames: int = 10) -> list:
+    """
+    Extract up to *max_frames* evenly-spaced frames from a video.
+
+    Returns a list of numpy arrays in RGBA format (required by nudenet's _read_image).
+    Returns an empty list if the video cannot be opened or has no decodable frames.
+    """
+    import cv2  # lazy import — not needed for the 'update' command
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        logger.warning("Cannot open video: %s", video_path)
+        return []
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
+        logger.warning("Video reports 0 frames, trying sequential read: %s", video_path)
+        # fallback: read first max_frames sequentially
+        frames = []
+        while len(frames) < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+            frames.append(rgba)
+        cap.release()
+        return frames
+
+    n = min(max_frames, total)
+    indices = [int(i * total / n) for i in range(n)]
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            # nudenet _read_image does COLOR_RGBA2BGR internally → pass RGBA
+            rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+            frames.append(rgba)
+    cap.release()
+    logger.debug("Extracted %d frame(s) from %s (total_frames=%d)", len(frames), video_path.name, total)
+    return frames
+
+
+def compute_nude_rate(video_path: Path, max_frames: int = 10) -> float:
+    """
+    Sample *max_frames* frames from the video and run NudeDetector on each.
+
+    Returns the maximum detection score across all explicit-class detections
+    in all sampled frames.  0.0 means nothing was detected; 1.0 means high
+    confidence of explicit nudity.
+    """
+    from nudenet import NudeDetector  # lazy import
+
+    frames = _extract_frames(video_path, max_frames=max_frames)
+    if not frames:
+        logger.warning("No frames extracted from %s — nude_rate=0.0", video_path.name)
+        return 0.0
+
+    detector = NudeDetector()
+    max_score = 0.0
+
+    try:
+        all_results = detector.detect_batch(frames)
+        for frame_results in all_results:
+            for det in frame_results:
+                if det.get("class") in _NUDE_EXPLICIT_CLASSES:
+                    score = float(det.get("score", 0.0))
+                    if score > max_score:
+                        max_score = score
+    except Exception as exc:
+        logger.warning("detect_batch failed (%s), trying frame-by-frame: %s", video_path.name, exc)
+        for frame in frames:
+            try:
+                for det in detector.detect(frame):
+                    if det.get("class") in _NUDE_EXPLICIT_CLASSES:
+                        score = float(det.get("score", 0.0))
+                        if score > max_score:
+                            max_score = score
+            except Exception as exc2:
+                logger.debug("detect failed on one frame: %s", exc2)
+
+    return round(float(max_score), 4)
+
+
+# ---------------------------------------------------------------------------
+# Command: update-nudes
+# ---------------------------------------------------------------------------
+
+def cmd_update_nudes(args: argparse.Namespace) -> None:
+    """
+    Scan WORK_DIR for posts that contain video files, compute nude_rate for each
+    using NudeDetector, and write the result to meta.json:
+
+        "nude_check": {
+            "nude_rate": 0.0,      # 0.0 = clean, 1.0 = explicit
+            "video_file": "name.mp4",
+            "frames_sampled": 10
+        }
+
+    Posts that already have nude_check are skipped unless --force is set.
+    """
+    work_dir: Path = Path(args.work_dir)
+
+    if not work_dir.exists():
+        logger.error("Work directory not found: %s", work_dir)
+        raise SystemExit(1)
+
+    # ---- collect posts with video files ----
+    posts_with_video: list[dict] = []
+
+    for channel_dir in sorted(work_dir.iterdir()):
+        if not channel_dir.is_dir() or channel_dir.name.startswith("."):
+            continue
+        if args.channel and channel_dir.name != args.channel:
+            continue
+
+        channel_name: str = channel_dir.name
+
+        for post_dir in sorted(channel_dir.iterdir()):
+            if not post_dir.is_dir() or not post_dir.name.isdigit():
+                continue
+
+            meta_path: Path = post_dir / "meta.json"
+            if not meta_path.exists():
+                continue
+
+            video_file = _find_video_file(post_dir)
+            if video_file is None:
+                logger.debug("[%s/%s] no video file, skipping", channel_name, post_dir.name)
+                continue
+
+            try:
+                meta: dict = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("[%s/%s] failed to read meta.json: %s", channel_name, post_dir.name, exc)
+                continue
+
+            if not args.force and "nude_check" in meta:
+                logger.debug("[%s/%s] already has nude_check, skipping", channel_name, post_dir.name)
+                continue
+
+            posts_with_video.append({
+                "id": f"{channel_name}/{post_dir.name}",
+                "meta_path": meta_path,
+                "video_file": video_file,
+            })
+
+    if not posts_with_video:
+        logger.info("No posts with video files to process.")
+        return
+
+    if args.limit:
+        posts_with_video = posts_with_video[: args.limit]
+        logger.info("Limited to first %d post(s) by --limit", len(posts_with_video))
+
+    logger.info(
+        "Found %d post(s) with video files to analyze (frames_per_video=%d)",
+        len(posts_with_video), args.frames,
+    )
+
+    if args.dry_run:
+        logger.info("[DRY RUN] Would analyze:")
+        for p in posts_with_video:
+            logger.info("  %s  (%s)", p["id"], p["video_file"].name)
+        return
+
+    total: int = len(posts_with_video)
+    updated: int = 0
+    errors: int = 0
+
+    for i, post_info in enumerate(posts_with_video, 1):
+        post_uid: str = post_info["id"]
+        video_file: Path = post_info["video_file"]
+        meta_path: Path = post_info["meta_path"]
+
+        logger.info("[%d/%d] %s: analyzing %s", i, total, post_uid, video_file.name)
+
+        try:
+            nude_rate = compute_nude_rate(video_file, max_frames=args.frames)
+        except Exception as exc:
+            logger.error("[%s] compute_nude_rate failed: %s", post_uid, exc, exc_info=True)
+            errors += 1
+            continue
+
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["nude_check"] = {
+                "nude_rate": nude_rate,
+                "video_file": video_file.name,
+                "frames_sampled": args.frames,
+            }
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            logger.info("[%s] nude_rate=%.4f  (%s)", post_uid, nude_rate, video_file.name)
+            updated += 1
+        except Exception as exc:
+            logger.error("[%s] failed to write meta.json: %s", post_uid, exc)
+            errors += 1
+
+    logger.info("Done. Updated: %d  Errors: %d  Total: %d", updated, errors, total)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -566,18 +804,65 @@ Examples:
     update_parser.add_argument(
         "--prompt-before",
         type=str,
-        default=str(Path(__file__).parent / "check_ad_prompt.p1.md"),
+        default=str(Path(__file__).parent / "llm" / "check_ad_prompt.p1.md"),
         metavar="FILE",
-        help="System prompt file (default: check_ad_prompt.p1.md)",
+        help="System prompt file (default: llm/check_ad_prompt.p1.md)",
     )
     update_parser.add_argument(
         "--prompt-after",
         type=str,
-        default=str(Path(__file__).parent / "check_ad_prompt.p2.md"),
+        default=str(Path(__file__).parent / "llm" / "check_ad_prompt.p2.md"),
         metavar="FILE",
-        help="User prompt template with {{ content }} placeholder (default: check_ad_prompt.p2.md)",
+        help="User prompt template with {{ content }} placeholder (default: llm/check_ad_prompt.p2.md)",
     )
     update_parser.set_defaults(func=cmd_update)
+
+    # --- update-nudes ---
+    update_nudes_parser = subparsers.add_parser(
+        "update-nudes",
+        help="Compute nude_rate for video posts and write to meta.json",
+    )
+    update_nudes_parser.add_argument(
+        "--work-dir",
+        type=str,
+        default=default_work_dir,
+        metavar="PATH",
+        help=f"Work directory with downloaded posts (default from .env WORK_DIR: {default_work_dir})",
+    )
+    update_nudes_parser.add_argument(
+        "--channel",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Process only this channel subdirectory (folder name, e.g. babazoyka)",
+    )
+    update_nudes_parser.add_argument(
+        "--frames",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of frames to sample from each video (default: 10)",
+    )
+    update_nudes_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Re-analyze posts that already have nude_check in meta.json",
+    )
+    update_nudes_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Show what would be analyzed without making any changes",
+    )
+    update_nudes_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stop after processing N posts (useful for testing)",
+    )
+    update_nudes_parser.set_defaults(func=cmd_update_nudes)
 
     args = parser.parse_args()
 
