@@ -16,7 +16,10 @@ Interest scoring (--sort interest-asc / interest-desc):
   Raw score = (reactions * w_r + forwards * w_f + replies * w_rep) / max(views, 1)
   Dividing by views normalises for channel audience size, so videos from small
   channels can outrank videos from large channels if they drove higher engagement.
-  Scores are then globally min-max normalised to the [0, 1] range.
+  Scores are then min-max normalised per channel so that within every channel
+  the least engaging video gets 0.0 and the most engaging gets 1.0.
+  This ensures each channel contributes videos spread across the full score range,
+  and no single channel dominates the top/bottom of the sort order.
   Weights are read from .env: INTEREST_W_REACTIONS, INTEREST_W_FORWARDS,
   INTEREST_W_REPLIES (defaults: 10, 5, 2).
 
@@ -320,22 +323,44 @@ def _compute_raw_interest(meta: dict, weights: InterestWeights) -> float:
     ) / views
 
 
+def _minmax_normalise(raw: dict[Path, float]) -> dict[Path, float]:
+    """
+    Apply min-max normalisation to a dict of raw scores.
+
+    The minimum score becomes 0.0 and the maximum becomes 1.0.
+    When all values are identical (or only one value exists), every entry
+    receives 0.5 so the order is stable but semantically neutral.
+    """
+    if not raw:
+        return {}
+    values: list[float] = list(raw.values())
+    min_v: float = min(values)
+    max_v: float = max(values)
+    span: float = max_v - min_v
+    if span == 0.0:
+        return {v: 0.5 for v in raw}
+    return {v: (s - min_v) / span for v, s in raw.items()}
+
+
 def compute_interest_scores(
     videos: list[Path],
     weights: InterestWeights,
 ) -> dict[Path, float]:
     """
-    Compute normalised interest scores in [0, 1] for every video in the list.
+    Compute per-channel normalised interest scores in [0, 1].
 
     Steps:
       1. Read meta.json from each video's post directory.
       2. Compute raw engagement rate (weighted signals / views).
-      3. Apply global min-max normalisation so the most engaging video gets 1.0
-         and the least engaging gets 0.0.
+      3. Group videos by channel (video.parent.parent).
+      4. Apply min-max normalisation independently within each channel so that
+         every channel contributes videos spread across the full [0, 1] range —
+         the least engaging video in a channel gets 0.0 and the most engaging
+         gets 1.0, regardless of the channel's absolute audience size.
 
     Videos whose meta.json is missing or unreadable receive a raw score of 0.0.
-    When all raw scores are identical (including all-zero), every video is
-    assigned 0.5 so the sort order is stable but semantically neutral.
+    When all raw scores inside a channel are identical, every video in that
+    channel is assigned 0.5.
     """
     raw: dict[Path, float] = {}
     for video in videos:
@@ -347,15 +372,22 @@ def compute_interest_scores(
             logger.debug(f"No interest score for {video.name}: {exc}")
             raw[video] = 0.0
 
-    values: list[float] = list(raw.values())
-    min_v: float = min(values) if values else 0.0
-    max_v: float = max(values) if values else 0.0
-    span: float = max_v - min_v
+    # group by channel directory (video → post_dir → channel_dir)
+    by_channel: dict[Path, dict[Path, float]] = {}
+    for video, score in raw.items():
+        channel_dir: Path = video.parent.parent
+        by_channel.setdefault(channel_dir, {})[video] = score
 
-    if span == 0.0:
-        return {v: 0.5 for v in videos}
+    result: dict[Path, float] = {}
+    for channel_dir, channel_raw in by_channel.items():
+        normalised = _minmax_normalise(channel_raw)
+        result.update(normalised)
+        logger.debug(
+            f"Interest scores for channel '{channel_dir.name}': "
+            + ", ".join(f"{v.name}={s:.3f}" for v, s in normalised.items())
+        )
 
-    return {v: (s - min_v) / span for v, s in raw.items()}
+    return result
 
 
 # ---------------------------------------------------------------------------
