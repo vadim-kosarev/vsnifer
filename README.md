@@ -12,7 +12,7 @@
 |---|---|
 | `vk_vsf_bot.py` | Подключается к Telegram-каналам, просматривает и скачивает посты с медиа |
 | `join_video.py` | Объединяет скачанные видеофайлы в один Full HD файл через FFmpeg |
-| `check_ad.py` | LLM-классификатор рекламы: обходит скачанные посты и дописывает `ad_check` в `meta.json` |
+| `check_ad.py` | LLM-классификатор рекламы (`update`) и детектор обнажённого контента (`update-nudes`): дописывает `ad_check` и `nude_check` в `meta.json` |
 | `config.py` | Конфигурация, управление прокси, ротация MTProxy, фильтр рекламы |
 | `.env` | Учётные данные и параметры (не коммитится) |
 | `.env.json` | Расширенная конфигурация: список прокси, правила фильтрации рекламы |
@@ -52,13 +52,26 @@
 - Идемпотентно — уже проверенные посты пропускаются (переопределяется `--force`)
 - `--dry-run` — покажет что будет обработано без единого запроса к LLM
 - Работает с любой моделью Ollama через `--model` или `OLLAMA_MODEL` в `.env`
+- `--think` — включает chain-of-thought (медленнее, полезно для отладки промптов)
+- Промпты настраиваемые: `--prompt-before` (system) и `--prompt-after` (user) — по умолчанию `llm/check_ad_prompt.p1.md` и `llm/check_ad_prompt.p2.md`
+
+### Детектор обнажённого контента (`check_ad.py update-nudes`)
+
+- Сканирует `WORK_DIR` в поиске постов с видеофайлами (`.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`, `.flv`)
+- Извлекает до N равномерно распределённых кадров из каждого видео (`--frames`, по умолчанию 10)
+- Прогоняет кадры через `NudeDetector` — детектирует обнажённые классы (`FEMALE_BREAST_EXPOSED`, `FEMALE_GENITALIA_EXPOSED`, `MALE_GENITALIA_EXPOSED`, `ANUS_EXPOSED`, `BUTTOCKS_EXPOSED`)
+- Итоговый `nude_rate` = максимальный score детекции среди всех кадров (0.0 = чисто, 1.0 = явный контент)
+- Дописывает результат в `meta.json`: `nude_check` с `nude_rate`, именем файла и числом проанализированных кадров
+- Идемпотентно — уже проверенные посты пропускаются (переопределяется `--force`)
+- `--dry-run` — покажет что будет обработано без запуска детектора
 
 ## Установка
 
 ### Требования
 - Python 3.10+
 - FFmpeg 6+ (для объединения видео)
-- Ollama (для `check_ad.py`) — https://ollama.com
+- Ollama (для `check_ad.py update`) — https://ollama.com
+- `nudenet` + `opencv-python` (для `check_ad.py update-nudes`) — устанавливаются через `requirements.txt`
 
 ### Шаги
 
@@ -250,7 +263,7 @@ python vk_vsf_bot.py download --all-channels --count 100 --work-dir H:\TEMP\vk_v
 
 ---
 
-### `check_ad.py` — LLM-классификация рекламы
+### `check_ad.py` — LLM-классификация рекламы и детектор контента
 
 #### Параметры команды `update`
 
@@ -263,7 +276,9 @@ python vk_vsf_bot.py download --all-channels --count 100 --work-dir H:\TEMP\vk_v
 | `--force` | Перепроверить уже проверенные посты | выкл. |
 | `--dry-run` | Показать что будет обработано, без запросов к LLM | выкл. |
 | `--limit N` | Обработать не более N постов (для теста) | без ограничений |
-| `--think` | Включить chain-of-thought в модели (медленней) | выкл. |
+| `--think` | Включить chain-of-thought в модели (медленней, полезно для отладки) | выкл. |
+| `--prompt-before FILE` | Файл system-промпта | `llm/check_ad_prompt.p1.md` |
+| `--prompt-after FILE` | Файл user-промпта (должен содержать `{{ content }}`) | `llm/check_ad_prompt.p2.md` |
 
 ```powershell
 # Справка
@@ -287,6 +302,12 @@ python check_ad.py update
 
 # С отладочным выводом промптов и ответа LLM
 python check_ad.py --log-level DEBUG update --limit 5
+
+# С chain-of-thought (медленнее, но полезно при отладке промпта)
+python check_ad.py update --think --limit 3
+
+# Использовать свои промпты
+python check_ad.py update --prompt-before llm/my_system.md --prompt-after llm/my_user.md
 ```
 
 Результат дописывается в каждый `meta.json`:
@@ -298,6 +319,47 @@ python check_ad.py --log-level DEBUG update --limit 5
 ```
 
 `ad_rate`: `0.0` = точно не реклама, `1.0` = точно реклама.
+
+---
+
+#### Параметры команды `update-nudes`
+
+| Параметр | Описание | Умолчание |
+|---|---|---|
+| `--work-dir` | Рабочий каталог с постами | `WORK_DIR` из `.env` |
+| `--channel NAME` | Обработать только этот канал (имя папки) | все каналы |
+| `--frames N` | Количество кадров для выборки из каждого видео | `10` |
+| `--force` | Перепроверить уже проверенные посты | выкл. |
+| `--dry-run` | Показать что будет обработано, без запуска детектора | выкл. |
+| `--limit N` | Обработать не более N постов (для теста) | без ограничений |
+
+```powershell
+# Справка
+python check_ad.py update-nudes --help
+
+# Посмотреть что будет обработано (без запуска детектора)
+python check_ad.py update-nudes --dry-run
+
+# Запустить на все посты с видео
+python check_ad.py update-nudes
+
+# Только один канал, больше кадров для точности
+python check_ad.py update-nudes --channel babazoyka --frames 20
+
+# Перепроверить уже проверенные
+python check_ad.py update-nudes --force --limit 10
+```
+
+Результат дописывается в каждый `meta.json`:
+```json
+"nude_check": {
+  "nude_rate": 0.0,
+  "video_file": "video.mp4",
+  "frames_sampled": 10
+}
+```
+
+`nude_rate`: `0.0` = чисто, `1.0` = явный контент. Используется в `join_video.py` через `--nude-rate-threshold` (порог по умолчанию: `0.65`, задаётся через `NUDE_RATE_THRESHOLD` в `.env`).
 
 ---
 
@@ -452,11 +514,18 @@ WORK_DIR/
   "ad_check": {
     "ad_rate": 0.05,
     "proof_of_ad": "Мем без ссылок на сторонние каналы, короткая подпись с эмодзи."
+  },
+  "nude_check": {
+    "nude_rate": 0.0,
+    "video_file": "video.mp4",
+    "frames_sampled": 10
   }
 }
 ```
 
 `ad_check` добавляется скриптом `check_ad.py update`. До запуска этого скрипта поле отсутствует.
+
+`nude_check` добавляется скриптом `check_ad.py update-nudes`. До запуска этого скрипта поле отсутствует.
 
 ## Выходной видеофайл
 

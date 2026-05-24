@@ -719,7 +719,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  update   Scan WORK_DIR, classify unchecked posts in batches, write ad_check to meta.json
+  update         Scan WORK_DIR, classify unchecked posts in batches, write ad_check to meta.json
+  update-nudes   Scan WORK_DIR for video posts, compute nude_rate with NudeDetector, write nude_check
 
 Examples:
   python check_ad.py update
@@ -729,7 +730,15 @@ Examples:
   python check_ad.py update --dry-run
   python check_ad.py update --channel babazoyka
   python check_ad.py update --limit 20
+  python check_ad.py update --think
+  python check_ad.py update --prompt-before llm/check_ad_prompt.p1.md --prompt-after llm/check_ad_prompt.p2.md
   python check_ad.py --log-level DEBUG update
+
+  python check_ad.py update-nudes
+  python check_ad.py update-nudes --frames 15
+  python check_ad.py update-nudes --channel babazoyka
+  python check_ad.py update-nudes --force --dry-run
+  python check_ad.py update-nudes --limit 20
         """,
     )
     parser.add_argument(
