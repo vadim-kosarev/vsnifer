@@ -126,3 +126,10 @@ vsnifer_session.session
 .env.json
 
 tmp/
+
+# Session files
+*.session
+
+# Output video files
+output.mp4
+*.mp4
