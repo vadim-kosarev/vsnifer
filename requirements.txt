@@ -1,10 +1,11 @@
 Telethon==1.43.2
-python-dotenv==1.0.0
-pydantic==2.5.3
-python-socks==2.5.3
 TelethonFakeTLS
+python-dotenv>=1.0.0
+python-socks>=2.5.0
 requests>=2.31.0
-fastmcp>=2.0
+pydantic>=2.5.0
+fastmcp>=2.0,<4.0
+langsmith>=0.2
 nudenet>=3.4
 opencv-python>=4.0
-
+langgraph-cli[inmem]

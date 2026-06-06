@@ -36,14 +36,28 @@ import json
 import logging
 import os
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
-import requests as http_requests
+# Load .env BEFORE third-party clients (langsmith, requests) are imported so
+# that HTTPS_PROXY and LANGSMITH_* vars are already in os.environ when those
+# libraries create their internal HTTP sessions.
 from dotenv import load_dotenv
+load_dotenv()
+
+# Propagate LANGSMITH_HTTP_PROXY → HTTPS_PROXY / HTTP_PROXY so that the
+# langsmith SDK (and requests) route traffic through the configured proxy.
+# Does not overwrite values already set in the environment directly.
+_ls_proxy: str | None = os.getenv("LANGSMITH_HTTP_PROXY")
+if _ls_proxy:
+    os.environ.setdefault("HTTPS_PROXY", _ls_proxy)
+    os.environ.setdefault("HTTP_PROXY", _ls_proxy)
+
+import requests as http_requests
+from langsmith import traceable
 from pydantic import BaseModel
 
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,6 +76,51 @@ logging.basicConfig(
     ],
 )
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LangSmith auth check
+# ---------------------------------------------------------------------------
+def _check_langsmith_auth() -> None:
+    """
+    Verify that the LangSmith API key is valid before the first trace is sent.
+
+    Performs a lightweight authenticated GET and logs a clear ERROR on 401/403
+    so the problem is visible without having to dig through DEBUG output.
+    Called once at startup when LANGSMITH_TRACING=true.
+    """
+    api_key: str | None = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
+    api_url: str = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com").rstrip("/")
+
+    if not api_key:
+        logger.warning(
+            "LangSmith tracing is enabled (LANGSMITH_TRACING=true) "
+            "but no API key found. Set LANGSMITH_API_KEY in .env."
+        )
+        return
+
+    try:
+        resp = http_requests.get(
+            f"{api_url}/workspaces",
+            headers={"x-api-key": api_key},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info("LangSmith auth OK (url=%s)", api_url)
+        elif resp.status_code in (401, 403):
+            logger.error(
+                "LangSmith auth FAILED (%d %s). "
+                "The API key is invalid or lacks write permissions. "
+                "Go to https://smith.langchain.com/settings -> API Keys, "
+                "create a new key with 'Service Key' role, "
+                "then update LANGSMITH_API_KEY in .env.",
+                resp.status_code,
+                resp.reason,
+            )
+        else:
+            logger.warning("LangSmith auth check returned unexpected status %d", resp.status_code)
+    except Exception as exc:
+        logger.warning("LangSmith auth check failed (connection error): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -112,20 +171,65 @@ def load_ollama_config() -> OllamaConfig:
 
 
 # ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
+def _parse_date(value: str) -> date:
+    """Parse YYYY-MM-DD string into a date object for argparse type=."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid date: {value!r}. Use YYYY-MM-DD.")
+
+
+def _parse_last_days(value: str) -> int:
+    """Parse --last-days value: accept '7' or '7d', return int."""
+    v = value.strip().lower().rstrip("d")
+    try:
+        n = int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid value: {value!r}. Use a number like 7 or 7d.")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"Value must be >= 1, got {n}")
+    return n
+
+
+def _resolve_date_range(
+    start_date: Optional[date],
+    end_date: Optional[date],
+    last_days: Optional[int],
+) -> tuple[Optional[date], Optional[date]]:
+    """
+    Compute the effective (start_date, end_date) pair.
+
+    --last-days N overrides --start-date when both are given.
+    Returns (None, None) when no date filter is active.
+    """
+    if last_days is not None:
+        return date.today() - timedelta(days=last_days - 1), end_date
+    return start_date, end_date
+
+
+# ---------------------------------------------------------------------------
 # Post collection
 # ---------------------------------------------------------------------------
 def collect_posts_to_check(
     work_dir: Path,
     channel_filter: Optional[str] = None,
     force: bool = False,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
 ) -> list[PostToCheck]:
     """
     Scan work_dir for posts that have both meta.json and text.txt.
 
     Skips posts whose meta.json already contains 'ad_check' unless force=True.
     If channel_filter is given, only that channel subdirectory is scanned.
+    If start_date or end_date is set, posts outside the range are skipped;
+    posts with no 'date' field in meta.json are also skipped when a date filter
+    is active (a warning is logged for each such post).
     Returns posts sorted by date descending (newest first), post_id descending as tiebreaker.
     """
+    date_filter_active: bool = start_date is not None or end_date is not None
     posts: list[PostToCheck] = []
 
     if not work_dir.exists():
@@ -159,6 +263,33 @@ def collect_posts_to_check(
             try:
                 meta: dict = json.loads(meta_path.read_text(encoding="utf-8"))
                 date_str = meta.get("date")
+
+                # --- date range filter ---
+                if date_filter_active:
+                    if not date_str:
+                        logger.warning(
+                            f"[{channel_name}/{post_id}] no 'date' in meta.json, "
+                            f"skipping (date filter active)"
+                        )
+                        continue
+                    try:
+                        post_date: date = date.fromisoformat(date_str[:10])
+                    except ValueError:
+                        logger.warning(
+                            f"[{channel_name}/{post_id}] cannot parse date {date_str!r}, skipping"
+                        )
+                        continue
+                    if start_date and post_date < start_date:
+                        logger.debug(
+                            f"[{channel_name}/{post_id}] before start_date ({start_date}), skipping"
+                        )
+                        continue
+                    if end_date and post_date > end_date:
+                        logger.debug(
+                            f"[{channel_name}/{post_id}] after end_date ({end_date}), skipping"
+                        )
+                        continue
+
                 if not force and "ad_check" in meta:
                     logger.debug(f"[{channel_name}/{post_id}] already checked, skipping")
                     continue
@@ -259,6 +390,11 @@ def _extract_json_array(text: str) -> str:
     return text.strip()
 
 
+@traceable(
+    run_type="llm",
+    name="ollama_chat",
+    project_name=os.getenv("LANGSMITH_PROJECT", "vsnifer"),
+)
 def _call_ollama(
     config: OllamaConfig,
     prompt_system: str,
@@ -291,6 +427,8 @@ def _call_ollama(
         f"Ollama: model={config.model}  {think_label}  "
         f"system={len(prompt_system)}c  user={len(prompt_user)}c"
     )
+    logger.debug("--- system prompt (%d chars) ---\n%s\n--- end system prompt ---", len(prompt_system), prompt_system)
+    logger.debug("--- user prompt (%d chars) ---\n%s\n--- end user prompt ---", len(prompt_user), prompt_user)
     print(f"\n--- Ollama ({config.model}, {think_label}) ---", flush=True)
 
     full_response: list[str] = []
@@ -416,10 +554,20 @@ def cmd_update(args: argparse.Namespace) -> None:
     prompt_system: str = _render_template(prompt_before_file.read_text(encoding="utf-8"))
     prompt_after_template: str = prompt_after_file.read_text(encoding="utf-8")
 
+    effective_start, effective_end = _resolve_date_range(
+        args.start_date, args.end_date, args.last_days
+    )
+    if effective_start or effective_end:
+        logger.info(
+            f"Date filter: [{effective_start or '...'} — {effective_end or '...'}]"
+        )
+
     posts: list[PostToCheck] = collect_posts_to_check(
         work_dir,
         channel_filter=args.channel,
         force=args.force,
+        start_date=effective_start,
+        end_date=effective_end,
     )
 
     if not posts:
@@ -611,6 +759,15 @@ def cmd_update_nudes(args: argparse.Namespace) -> None:
         logger.error("Work directory not found: %s", work_dir)
         raise SystemExit(1)
 
+    effective_start, effective_end = _resolve_date_range(
+        args.start_date, args.end_date, args.last_days
+    )
+    if effective_start or effective_end:
+        logger.info(
+            "Date filter: [%s — %s]", effective_start or "...", effective_end or "..."
+        )
+    date_filter_active: bool = effective_start is not None or effective_end is not None
+
     # ---- collect posts with video files ----
     posts_with_video: list[dict] = []
 
@@ -640,6 +797,33 @@ def cmd_update_nudes(args: argparse.Namespace) -> None:
             except Exception as exc:
                 logger.warning("[%s/%s] failed to read meta.json: %s", channel_name, post_dir.name, exc)
                 continue
+
+            # --- date range filter ---
+            if date_filter_active:
+                date_str: Optional[str] = meta.get("date")
+                if not date_str:
+                    logger.warning(
+                        "[%s/%s] no 'date' in meta.json, skipping (date filter active)",
+                        channel_name, post_dir.name,
+                    )
+                    continue
+                try:
+                    post_date: date = date.fromisoformat(date_str[:10])
+                except ValueError:
+                    logger.warning(
+                        "[%s/%s] cannot parse date %r, skipping", channel_name, post_dir.name, date_str
+                    )
+                    continue
+                if effective_start and post_date < effective_start:
+                    logger.debug(
+                        "[%s/%s] before start_date (%s), skipping", channel_name, post_dir.name, effective_start
+                    )
+                    continue
+                if effective_end and post_date > effective_end:
+                    logger.debug(
+                        "[%s/%s] after end_date (%s), skipping", channel_name, post_dir.name, effective_end
+                    )
+                    continue
 
             if not args.force and "nude_check" in meta:
                 logger.debug("[%s/%s] already has nude_check, skipping", channel_name, post_dir.name)
@@ -731,6 +915,10 @@ Examples:
   python check_ad.py update --channel babazoyka
   python check_ad.py update --limit 20
   python check_ad.py update --think
+  python check_ad.py update --start-date 2026-05-01
+  python check_ad.py update --last-days 7
+  python check_ad.py update --force --last-days 7
+  python check_ad.py update --start-date 2026-05-01 --end-date 2026-05-31
   python check_ad.py update --prompt-before llm/check_ad_prompt.p1.md --prompt-after llm/check_ad_prompt.p2.md
   python check_ad.py --log-level DEBUG update
 
@@ -739,6 +927,8 @@ Examples:
   python check_ad.py update-nudes --channel babazoyka
   python check_ad.py update-nudes --force --dry-run
   python check_ad.py update-nudes --limit 20
+  python check_ad.py update-nudes --last-days 7
+  python check_ad.py update-nudes --force --start-date 2026-05-01 --end-date 2026-05-31
         """,
     )
     parser.add_argument(
@@ -811,6 +1001,30 @@ Examples:
         help="Enable chain-of-thought reasoning in the model (slower, useful for debugging)",
     )
     update_parser.add_argument(
+        "--start-date",
+        type=_parse_date,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Process only posts published on or after this date",
+    )
+    update_parser.add_argument(
+        "--end-date",
+        type=_parse_date,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Process only posts published on or before this date",
+    )
+    update_parser.add_argument(
+        "--last-days",
+        type=_parse_last_days,
+        default=None,
+        metavar="N",
+        help=(
+            "Process only posts from the last N days (including today). "
+            "Accepts 7 or 7d. Overrides --start-date."
+        ),
+    )
+    update_parser.add_argument(
         "--prompt-before",
         type=str,
         default=str(Path(__file__).parent / "llm" / "check_ad_prompt.p1.md"),
@@ -871,6 +1085,30 @@ Examples:
         metavar="N",
         help="Stop after processing N posts (useful for testing)",
     )
+    update_nudes_parser.add_argument(
+        "--start-date",
+        type=_parse_date,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Process only posts published on or after this date",
+    )
+    update_nudes_parser.add_argument(
+        "--end-date",
+        type=_parse_date,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Process only posts published on or before this date",
+    )
+    update_nudes_parser.add_argument(
+        "--last-days",
+        type=_parse_last_days,
+        default=None,
+        metavar="N",
+        help=(
+            "Process only posts from the last N days (including today). "
+            "Accepts 7 or 7d. Overrides --start-date."
+        ),
+    )
     update_nudes_parser.set_defaults(func=cmd_update_nudes)
 
     args = parser.parse_args()
@@ -886,6 +1124,10 @@ Examples:
     if not args.command:
         parser.print_help()
         return
+
+    # Validate LangSmith credentials early so auth errors are immediately visible.
+    if os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes"):
+        _check_langsmith_auth()
 
     try:
         args.func(args)

@@ -133,3 +133,4 @@ tmp/
 # Output video files
 output.mp4
 *.mp4
+app/**

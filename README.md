@@ -304,6 +304,9 @@ python vk_vsf_bot.py download --all-channels --count 100 --work-dir H:\TEMP\vk_v
 | `--dry-run` | Показать что будет обработано, без запросов к LLM | выкл. |
 | `--limit N` | Обработать не более N постов (для теста) | без ограничений |
 | `--think` | Включить chain-of-thought в модели (медленней, полезно для отладки) | выкл. |
+| `--start-date YYYY-MM-DD` | Обработать только посты, опубликованные начиная с этой даты | без ограничения |
+| `--end-date YYYY-MM-DD` | Обработать только посты, опубликованные не позже этой даты | без ограничения |
+| `--last-days N` | Обработать только посты за последние N дней (включая сегодня). Принимает `7` или `7d`. Перекрывает `--start-date`. | без ограничения |
 | `--prompt-before FILE` | Файл system-промпта | `llm/check_ad_prompt.p1.md` |
 | `--prompt-after FILE` | Файл user-промпта (должен содержать `{{ content }}`) | `llm/check_ad_prompt.p2.md` |
 
@@ -333,6 +336,14 @@ python check_ad.py --log-level DEBUG update --limit 5
 # С chain-of-thought (медленнее, но полезно при отладке промпта)
 python check_ad.py update --think --limit 3
 
+# Фильтрация по датам
+python check_ad.py update --last-days 7
+python check_ad.py update --start-date 2026-05-01
+python check_ad.py update --start-date 2026-05-01 --end-date 2026-05-31
+
+# Перепроверить уже проверенные посты, но только за последнюю неделю
+python check_ad.py update --force --last-days 7
+
 # Использовать свои промпты
 python check_ad.py update --prompt-before llm/my_system.md --prompt-after llm/my_user.md
 ```
@@ -359,6 +370,9 @@ python check_ad.py update --prompt-before llm/my_system.md --prompt-after llm/my
 | `--force` | Перепроверить уже проверенные посты | выкл. |
 | `--dry-run` | Показать что будет обработано, без запуска детектора | выкл. |
 | `--limit N` | Обработать не более N постов (для теста) | без ограничений |
+| `--start-date YYYY-MM-DD` | Обработать только посты, опубликованные начиная с этой даты | без ограничения |
+| `--end-date YYYY-MM-DD` | Обработать только посты, опубликованные не позже этой даты | без ограничения |
+| `--last-days N` | Обработать только посты за последние N дней (включая сегодня). Принимает `7` или `7d`. Перекрывает `--start-date`. | без ограничения |
 
 ```powershell
 # Справка
@@ -372,6 +386,12 @@ python check_ad.py update-nudes
 
 # Только один канал, больше кадров для точности
 python check_ad.py update-nudes --channel babazoyka --frames 20
+
+# Только посты за последние 7 дней
+python check_ad.py update-nudes --last-days 7
+
+# Перепроверить за конкретный период
+python check_ad.py update-nudes --force --start-date 2026-05-01 --end-date 2026-05-31
 
 # Перепроверить уже проверенные
 python check_ad.py update-nudes --force --limit 10
