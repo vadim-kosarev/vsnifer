@@ -36,6 +36,8 @@ import json
 import logging
 import os
 import re
+import sys
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -57,6 +59,8 @@ if _ls_proxy:
 import requests as http_requests
 from langsmith import traceable
 from pydantic import BaseModel
+
+from config import ChannelConfig, load_app_config
 
 
 # ---------------------------------------------------------------------------
@@ -329,16 +333,71 @@ def collect_posts_to_check(
     return posts
 
 
-def write_ad_check_to_meta(meta_path: Path, result: AdCheckResult) -> None:
+def write_ad_check_to_meta(meta_path: Path, result: AdCheckResult) -> Optional[dict]:
     """
     Load meta.json, add or overwrite the 'ad_check' key, and write back.
+    Returns the previous ad_check dict, or None if it did not exist.
     """
     meta: dict = json.loads(meta_path.read_text(encoding="utf-8"))
+    old: Optional[dict] = meta.get("ad_check")
     meta["ad_check"] = {
         "ad_rate": result.ad_rate,
         "proof_of_ad": result.proof_of_ad,
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return old
+
+
+# ---------------------------------------------------------------------------
+# Whitelist pre-filter
+# ---------------------------------------------------------------------------
+
+_URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
+
+
+def _parse_whitelist_ids(channels: list[ChannelConfig]) -> set[str]:
+    """
+    Extract a set of lowercase t.me path identifiers from a list of ChannelConfig.
+
+    https://t.me/username  -> 'username'
+    https://t.me/+HASH     -> '+hash'
+    """
+    ids: set[str] = set()
+    for ch in channels:
+        m = re.search(r"t\.me/([^\s,/?#]+)", ch.url)
+        if m:
+            ids.add(m.group(1).rstrip("/").lower())
+    return ids
+
+
+def _format_channels_json(channels: list[ChannelConfig]) -> str:
+    """Serialize channels as a compact JSON array for LLM prompt injection."""
+    return json.dumps(
+        [{"url": c.url, "name": c.name} for c in channels],
+        ensure_ascii=False,
+    )
+
+
+def _has_only_whitelisted_links(content: str, whitelist_ids: set[str]) -> bool:
+    """
+    Return True if every URL in *content* is either a whitelisted t.me channel
+    or a max.ru link (channel's own MAX presence, always safe).
+
+    Posts with no URLs return False so the LLM still evaluates text-only ad signals.
+    """
+    urls = _URL_RE.findall(content)
+    if not urls:
+        return False
+    for url in urls:
+        if "max.ru" in url:
+            continue
+        m = re.match(r"https?://t\.me/([^\s/?#)\]>\"']+)", url)
+        if m:
+            ident = m.group(1).rstrip("/").lower()
+            if ident in whitelist_ids:
+                continue
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -481,10 +540,20 @@ def classify_batch(
     else:
         prompt_user = _render_template(prompt_after_template, extra={"content": input_json})
 
-    try:
-        raw_response: str = _call_ollama(config, prompt_system, prompt_user, think=think)
-    except Exception as exc:
-        logger.error(f"Ollama call failed: {exc}")
+    raw_response: str = ""
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            raw_response = _call_ollama(config, prompt_system, prompt_user, think=think)
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                logger.warning(f"Ollama call failed (attempt {attempt + 1}/3): {exc}. Retrying in 5s...")
+                time.sleep(5)
+    if last_exc is not None:
+        logger.error(f"Ollama call failed after 3 attempts: {last_exc}")
         return []
 
     logger.debug("Raw response (%d chars):\n%s", len(raw_response), raw_response)
@@ -539,10 +608,10 @@ def cmd_update(args: argparse.Namespace) -> None:
         logger.error(f"Work directory not found: {work_dir}")
         raise SystemExit(1)
 
-    prompt_before_file: Path = Path(args.prompt_before)
-    prompt_after_file: Path = Path(args.prompt_after)
+    prompt_system_file: Path = Path(args.prompt_system)
+    prompt_user_file: Path = Path(args.prompt_user)
 
-    for path in (prompt_before_file, prompt_after_file):
+    for path in (prompt_system_file, prompt_user_file):
         if not path.exists():
             logger.error(f"Prompt file not found: {path}")
             raise SystemExit(1)
@@ -551,8 +620,16 @@ def cmd_update(args: argparse.Namespace) -> None:
     if args.model:
         config = config.model_copy(update={"model": args.model})
 
-    prompt_system: str = _render_template(prompt_before_file.read_text(encoding="utf-8"))
-    prompt_after_template: str = prompt_after_file.read_text(encoding="utf-8")
+    app_config = load_app_config()
+    channels = app_config.channels
+    if not channels:
+        logger.warning("No channels defined in .env.json — whitelist pre-filter disabled, CHANNELS placeholder will be empty")
+    channels_json: str = _format_channels_json(channels)
+    logger.info("Loaded %d channel(s) from .env.json", len(channels))
+
+    channel_extra = {"CHANNELS": channels_json}
+    prompt_system: str = _render_template(prompt_system_file.read_text(encoding="utf-8"), extra=channel_extra)
+    prompt_after_template: str = prompt_user_file.read_text(encoding="utf-8")
 
     effective_start, effective_end = _resolve_date_range(
         args.start_date, args.end_date, args.last_days
@@ -574,24 +651,63 @@ def cmd_update(args: argparse.Namespace) -> None:
         logger.info("No posts to classify.")
         return
 
+    # Pre-filter: posts whose only links are whitelisted channels need no LLM call.
+    whitelist_ids = _parse_whitelist_ids(channels)
+    auto_clear: list[PostToCheck] = []
+    to_classify: list[PostToCheck] = posts
+    if whitelist_ids:
+        auto_clear = [p for p in posts if _has_only_whitelisted_links(p.content, whitelist_ids)]
+        to_classify = [p for p in posts if not _has_only_whitelisted_links(p.content, whitelist_ids)]
+        if auto_clear:
+            logger.info(
+                "Pre-filter: %d post(s) have only whitelisted links → ad_rate=0.0 (skipping LLM)",
+                len(auto_clear),
+            )
+
     if args.limit:
-        posts = posts[: args.limit]
-        logger.info(f"Limited to first {len(posts)} post(s) by --limit")
+        to_classify = to_classify[: args.limit]
+        logger.info(f"Limited to first {len(to_classify)} post(s) for LLM by --limit")
 
     if args.dry_run:
-        logger.info(f"[DRY RUN] Would classify {len(posts)} post(s) in batches of {batch_size}")
-        for p in posts:
+        logger.info(
+            f"[DRY RUN] Pre-filter (ad_rate=0.0, no LLM): {len(auto_clear)} post(s)"
+        )
+        for p in auto_clear:
+            logger.info(f"  {p.id}")
+        logger.info(
+            f"[DRY RUN] Would classify with LLM: {len(to_classify)} post(s) in batches of {batch_size}"
+        )
+        for p in to_classify:
             logger.info(f"  {p.id}")
         return
 
-    total: int = len(posts)
+    total: int = len(auto_clear) + len(to_classify)
     updated: int = 0
     errors: int = 0
 
-    for batch_start in range(0, total, batch_size):
-        batch: list[PostToCheck] = posts[batch_start: batch_start + batch_size]
+    # Write pre-filtered results directly without calling LLM.
+    for post in auto_clear:
+        result = AdCheckResult(
+            id=post.id,
+            ad_rate=0.0,
+            proof_of_ad="Все ссылки из белого списка, реклама не обнаружена.",
+        )
+        try:
+            old = write_ad_check_to_meta(post.meta_path, result)
+            if old is not None:
+                logger.info(f"[{post.id}] pre-filter: ad_rate {old['ad_rate']:.2f} -> 0.0")
+            else:
+                logger.info(f"[{post.id}] pre-filter: ad_rate=0.0")
+            updated += 1
+        except Exception as exc:
+            logger.error(f"[{post.id}] failed to write meta.json: {exc}")
+            errors += 1
+
+    llm_total: int = len(to_classify)
+    for batch_start in range(0, llm_total, batch_size):
+        batch: list[PostToCheck] = to_classify[batch_start: batch_start + batch_size]
         ids: str = ", ".join(p.id for p in batch)
-        logger.info(f"Batch [{batch_start + 1}..{batch_start + len(batch)}/{total}]: {ids}")
+        logger.info(f"Batch [{batch_start + 1}..{batch_start + len(batch)}/{llm_total}]: {ids}")
 
         results: list[AdCheckResult] = classify_batch(
             batch, config, prompt_system, prompt_after_template, think=args.think
@@ -611,8 +727,14 @@ def cmd_update(args: argparse.Namespace) -> None:
                 errors += 1
                 continue
             try:
-                write_ad_check_to_meta(post.meta_path, result)
-                logger.info(f"[{post.id}] ad_rate={result.ad_rate:.2f}  {result.proof_of_ad}")
+                old = write_ad_check_to_meta(post.meta_path, result)
+                if old is not None:
+                    logger.info(
+                        f"[{post.id}] ad_rate: {old['ad_rate']:.2f} -> {result.ad_rate:.2f}"
+                        f"  proof: {old['proof_of_ad']!r} -> {result.proof_of_ad!r}"
+                    )
+                else:
+                    logger.info(f"[{post.id}] ad_rate={result.ad_rate:.2f}  {result.proof_of_ad}")
                 updated += 1
             except Exception as exc:
                 logger.error(f"[{post.id}] failed to write meta.json: {exc}")
@@ -919,7 +1041,7 @@ Examples:
   python check_ad.py update --last-days 7
   python check_ad.py update --force --last-days 7
   python check_ad.py update --start-date 2026-05-01 --end-date 2026-05-31
-  python check_ad.py update --prompt-before llm/check_ad_prompt.p1.md --prompt-after llm/check_ad_prompt.p2.md
+  python check_ad.py update --prompt-system llm/check_ad_prompt.p1.md --prompt-user llm/check_ad_prompt.p2.md
   python check_ad.py --log-level DEBUG update
 
   python check_ad.py update-nudes
@@ -1025,14 +1147,14 @@ Examples:
         ),
     )
     update_parser.add_argument(
-        "--prompt-before",
+        "--prompt-system",
         type=str,
         default=str(Path(__file__).parent / "llm" / "check_ad_prompt.p1.md"),
         metavar="FILE",
         help="System prompt file (default: llm/check_ad_prompt.p1.md)",
     )
     update_parser.add_argument(
-        "--prompt-after",
+        "--prompt-user",
         type=str,
         default=str(Path(__file__).parent / "llm" / "check_ad_prompt.p2.md"),
         metavar="FILE",
@@ -1110,6 +1232,15 @@ Examples:
         ),
     )
     update_nudes_parser.set_defaults(func=cmd_update_nudes)
+
+    # Support 'help [command]' syntax per CLAUDE.python.md conventions.
+    # Rewrite: help update  ->  update --help
+    #          help         ->  --help
+    if len(sys.argv) >= 2 and sys.argv[1] == "help":
+        if len(sys.argv) >= 3:
+            sys.argv = [sys.argv[0], sys.argv[2], "--help"]
+        else:
+            sys.argv = [sys.argv[0], "--help"]
 
     args = parser.parse_args()
 

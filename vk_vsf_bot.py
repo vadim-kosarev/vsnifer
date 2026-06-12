@@ -344,29 +344,29 @@ def normalize_channel_id(channel_id: str) -> str:
 
 def parse_channels_env() -> list[str]:
     """
-    Parse CHANNELS env var (comma-separated list) into normalized channel IDs.
+    Return the list of channel IDs to operate on.
 
-    Falls back to TARGET_CHANNEL if CHANNELS is not set.
-    Returns an empty list if neither is configured.
-
-    Examples of valid .env entries:
-      CHANNELS=@babazoyka
-      CHANNELS=@babazoyka, https://t.me/+5wnJFWU8yLZjNTdi, +otRtx2aMM0ZlMTVi
+    Priority:
+      1. channels[] in .env.json  (preferred — structured, with names)
+      2. CHANNELS env var         (legacy fallback)
+      3. TARGET_CHANNEL env var   (single-channel fallback)
     """
-    raw: str = os.getenv("CHANNELS", "").strip()
-    if raw:
-        channels: list[str] = [
-            normalize_channel_id(c)
-            for c in raw.split(",")
-            if c.strip()
-        ]
-        logger.debug(f"Parsed CHANNELS env: {channels}")
+    from config import load_app_config
+    app_config = load_app_config()
+    if app_config.channels:
+        channels = [normalize_channel_id(c.url) for c in app_config.channels]
+        logger.debug("Parsed channels from .env.json: %s", channels)
         return channels
 
-    # Fallback: single TARGET_CHANNEL
+    raw: str = os.getenv("CHANNELS", "").strip()
+    if raw:
+        channels = [normalize_channel_id(c) for c in raw.split(",") if c.strip()]
+        logger.debug("Parsed CHANNELS env (legacy): %s", channels)
+        return channels
+
     target: str = os.getenv("TARGET_CHANNEL", "").strip()
     if target:
-        logger.debug(f"CHANNELS not set, falling back to TARGET_CHANNEL: {target}")
+        logger.debug("Falling back to TARGET_CHANNEL: %s", target)
         return [normalize_channel_id(target)]
 
     return []

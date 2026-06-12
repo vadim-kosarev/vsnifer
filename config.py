@@ -46,6 +46,15 @@ _logger: logging.Logger = logging.getLogger(__name__)
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+class ChannelConfig(BaseModel):
+    """A single Telegram channel entry from .env.json."""
+
+    url: str   # Full URL: https://t.me/username or https://t.me/+HASH
+    name: str  # Human-readable channel name
+
+    model_config = {"extra": "forbid"}
+
+
 class ProxyConfig(BaseModel):
     """Single proxy server configuration."""
 
@@ -60,6 +69,7 @@ class ProxyConfig(BaseModel):
 class AppConfig(BaseModel):
     """Extended application configuration loaded from .env.json."""
 
+    channels: list[ChannelConfig] = []
     proxies: list[ProxyConfig] = []
     # How many connection drops in the rolling window before we switch proxy.
     proxy_switch_max_drops: int = 3
