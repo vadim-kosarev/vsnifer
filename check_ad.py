@@ -381,8 +381,9 @@ def _format_channels_json(channels: list[ChannelConfig]) -> str:
 def _has_only_whitelisted_links(content: str, whitelist_ids: set[str]) -> bool:
     """
     Return True if every URL in *content* is either a whitelisted t.me channel
-    or a max.ru link (channel's own MAX presence, always safe).
+    or a safe max.ru link (channel's own page like max.ru/CHANNELNAME).
 
+    max.ru/join/* links are invite links to arbitrary channels and are NOT safe.
     Posts with no URLs return False so the LLM still evaluates text-only ad signals.
     """
     urls = _URL_RE.findall(content)
@@ -390,7 +391,9 @@ def _has_only_whitelisted_links(content: str, whitelist_ids: set[str]) -> bool:
         return False
     for url in urls:
         if "max.ru" in url:
-            continue
+            if "/join/" not in url:
+                continue
+            return False
         m = re.match(r"https?://t\.me/([^\s/?#)\]>\"']+)", url)
         if m:
             ident = m.group(1).rstrip("/").lower()

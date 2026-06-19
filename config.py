@@ -105,6 +105,8 @@ class AdFilterConfig(BaseModel):
                                 or empty). false = off.
       ban_llm_ad_rate_threshold  — ban posts whose ad_check.ad_rate >= threshold
                                    (0.0 = disabled). Default 0.85.
+      ban_no_ad_check         — ban posts not yet classified by check_ad.py
+                                   (no ad_check in meta.json). Default true.
       ban_nude_rate_threshold — ban video posts whose nude_check.nude_rate >= threshold
                                 (0.0 = disabled). Default 0.5. Override via .env
                                 NUDE_RATE_THRESHOLD or CLI --nude-rate-threshold.
@@ -122,6 +124,8 @@ class AdFilterConfig(BaseModel):
     # Populated by check_ad.py update; posts without ad_check are never banned
     # by this rule regardless of the threshold.
     ban_llm_ad_rate_threshold: float = 0.85
+    # Ban posts that have not been checked by check_ad.py yet (no ad_check in meta.json).
+    ban_no_ad_check: bool = True
     # Ban video posts whose nude_check.nude_rate >= this threshold (0.0 = disabled).
     # Populated by check_ad.py update-nudes; posts without nude_check are never
     # banned by this rule.  Override via .env NUDE_RATE_THRESHOLD or

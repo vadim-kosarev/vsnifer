@@ -741,7 +741,6 @@ def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
     # ------------------------------------------------------------------
     # Rule: LLM ad classification — ban if ad_check.ad_rate >= threshold
     # .env.json → ad_filter.ban_llm_ad_rate_threshold  (default: 0.85)
-    # Posts without ad_check in meta.json are never banned by this rule.
     # Set threshold to 0.0 in .env.json to disable.
     # ------------------------------------------------------------------
     if cfg.ban_llm_ad_rate_threshold and cfg.ban_llm_ad_rate_threshold > 0.0:
@@ -755,6 +754,18 @@ def build_ban_rules(cfg: AdFilterConfig) -> list[BanRule]:
             return None
 
         rules.append(_rule_llm_ad_rate)
+
+    # ------------------------------------------------------------------
+    # Rule: ban posts without ad_check (not yet classified by check_ad.py)
+    # .env.json → ad_filter.ban_no_ad_check  (default: true)
+    # ------------------------------------------------------------------
+    if cfg.ban_no_ad_check:
+        def _rule_no_ad_check(ctx: PostContext) -> Optional[str]:
+            if ctx.ad_rate is None:
+                return "no ad_check in meta.json (not yet classified)"
+            return None
+
+        rules.append(_rule_no_ad_check)
 
     # ------------------------------------------------------------------
     # Rule: nudity score — ban if nude_check.nude_rate >= threshold
@@ -1380,7 +1391,7 @@ Examples:
         help=(
             "Override the LLM ad_rate ban threshold (0.0–1.0). "
             "Posts with ad_check.ad_rate >= this value are excluded. "
-            "Posts without ad_check are never excluded by this rule. "
+            "Posts without ad_check are excluded by ban_no_ad_check (default: on). "
             "Default: ban_llm_ad_rate_threshold from .env.json (0.85 if not set). "
             "Set to 0.0 to disable."
         ),
@@ -1476,7 +1487,7 @@ Examples:
     else:
         _thr = f"ad_rate >= {_ad_rate_thr}"
         _nude_thr = f"nude_rate >= {_nude_rate_thr}"
-        _ad_filter_str = f"ON  (ban if {_thr} | {_nude_thr})"
+        _ad_filter_str = f"ON  (ban if {_thr} | {_nude_thr} | unchecked)"
 
     _limit_str = str(args.limit) + " random" if args.limit is not None else "all"
     _out_w, _out_h = output_dimensions(args.orientation)

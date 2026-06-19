@@ -223,7 +223,8 @@ CHANNELS=@babazoyka, https://t.me/+otRtx2aMM0ZlMTVi, +HRom-yzU75JhYzIy
 | `ban_min_duration_sec` | число | Бан если ролик короче N секунд (`0` = выкл.) |
 | `ban_max_duration_sec` | число | Бан если ролик длиннее N секунд (`0` = выкл.) |
 | `ban_max_file_size_mb` | число | Бан если файл тяжелее N МБ (`0` = выкл.) |
-| `ban_llm_ad_rate_threshold` | число 0.0–1.0 | Бан если `meta.json["ad_check"]["ad_rate"]` >= значения. Посты без `ad_check` не баним. `0.0` = выкл. По умолчанию `0.85` |
+| `ban_llm_ad_rate_threshold` | число 0.0–1.0 | Бан если `meta.json["ad_check"]["ad_rate"]` >= значения. `0.0` = выкл. По умолчанию `0.85` |
+| `ban_no_ad_check` | bool | Бан постов без `ad_check` в `meta.json` (ещё не проверены `check_ad.py`). По умолчанию `true` |
 
 Дополнительные правила на Python добавляются непосредственно в функцию `build_ban_rules()` в `join_video.py` — там есть секция с примерами.
 
