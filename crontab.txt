@@ -1,2 +1,1 @@
-15 2 * * * cron-daily.cmd
 0 5 * * 5 cron-weekly.cmd
