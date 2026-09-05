@@ -605,23 +605,9 @@ async def _download_with_watchdog(
 
 async def cmd_download(args: argparse.Namespace) -> None:
     """
-    Handle 'download' command — fetch posts with media into work/<channel>/.
-
-    Channel resolution:
-      --channel @foo      -> single channel
-      --all-channels      -> all channels from CHANNELS env var
-      (neither)           -> TARGET_CHANNEL env var (single fallback)
-
-    Proxy rotation:
-      Proxies are read from .env.json (proxies list).  A ConnectionDropMonitor
-      watches the Telethon connection logger for "Server closed the connection"
-      events.  When proxy_switch_max_drops drops occur within
-      proxy_switch_window_secs, the download is interrupted, the proxy is
-      advanced to the next one in the list, a new TelegramClient is created,
-      and the download resumes (already-downloaded posts are skipped).
+    Handle 'download' command with retry logic.
+    If not all channels download successfully, retries for up to 20 hours (40 × 30min).
     """
-    work_dir: Path = Path(args.work_dir)
-
     # Determine channel list
     if args.all_channels:
         channels: list[str] = parse_channels_env()
@@ -641,6 +627,7 @@ async def cmd_download(args: argparse.Namespace) -> None:
         logger.error("No channels configured. Use --channel or set CHANNELS in .env")
         raise ValueError("No channels configured")
 
+    work_dir: Path = Path(args.work_dir)
     count: int = args.count
     refresh_meta: bool = getattr(args, "refresh_meta", False)
 
@@ -649,7 +636,6 @@ async def cmd_download(args: argparse.Namespace) -> None:
     if args.since:
         try:
             since = datetime.fromisoformat(args.since)
-            # Make timezone-aware (UTC) if naive — Telegram dates are always UTC
             if since.tzinfo is None:
                 since = since.replace(tzinfo=timezone.utc)
             logger.info(f"Filtering posts since: {since.isoformat()}")
@@ -668,77 +654,97 @@ async def cmd_download(args: argparse.Namespace) -> None:
         logger.error(f"Credential error: {e}")
         raise
 
-    # --- Proxy manager + connection drop monitor --------------------------
-    app_config = load_app_config()
-    proxy_manager = ProxyManager(app_config.proxies)
-    monitor = ConnectionDropMonitor(
-        max_drops=app_config.proxy_switch_max_drops,
-        window_secs=app_config.proxy_switch_window_secs,
-    )
-    monitor.attach()
+    # Retry loop: keep trying for up to 20 hours if not all channels complete
+    max_retries = 40  # ~20 hours (40 retries × 30 min)
+    retry_delay_sec = 1800  # 30 minutes
+    retry_count = 0
 
-    completed_channels: set[str] = set()
-    # At least one attempt; at most one attempt per proxy in the list.
-    max_attempts: int = max(proxy_manager.count, 1)
-
-    for attempt in range(max_attempts):
-        remaining: list[str] = [ch for ch in channels if ch not in completed_channels]
-        if not remaining:
-            break
-
-        if attempt > 0:
-            proxy_manager.advance()
-
-        logger.info(
-            f"Proxy attempt {attempt + 1}/{max_attempts}: {proxy_manager.describe_current()}"
+    while True:
+        app_config = load_app_config()
+        proxy_manager = ProxyManager(app_config.proxies)
+        monitor = ConnectionDropMonitor(
+            max_drops=app_config.proxy_switch_max_drops,
+            window_secs=app_config.proxy_switch_window_secs,
         )
+        monitor.attach()
 
-        client: TelegramClient = TelegramClient(
-            "vsnifer_session",
-            credentials.api_id,
-            credentials.api_hash,
-            **proxy_manager.build_client_kwargs(),
-        )
+        completed_channels: set[str] = set()
+        max_attempts: int = max(proxy_manager.count, 1)
 
-        switch_triggered: bool = False
-        try:
-            if credentials.phone:
-                await asyncio.wait_for(client.start(phone=credentials.phone), timeout=120)
-            else:
-                await asyncio.wait_for(
-                    client.start(bot_token=credentials.bot_token), timeout=30
-                )
+        for attempt in range(max_attempts):
+            remaining: list[str] = [ch for ch in channels if ch not in completed_channels]
+            if not remaining:
+                break
 
-            for channel_id in remaining:
-                logger.info(f"--- Channel: {channel_id} ---")
-                try:
-                    switch_triggered = await _download_with_watchdog(
-                        client, channel_id, count, work_dir, since, monitor, refresh_meta
+            if attempt > 0:
+                proxy_manager.advance()
+
+            logger.info(
+                f"Proxy attempt {attempt + 1}/{max_attempts}: {proxy_manager.describe_current()}"
+            )
+
+            client: TelegramClient = TelegramClient(
+                "vsnifer_session",
+                credentials.api_id,
+                credentials.api_hash,
+                **proxy_manager.build_client_kwargs(),
+            )
+
+            switch_triggered: bool = False
+            try:
+                if credentials.phone:
+                    await asyncio.wait_for(client.start(phone=credentials.phone), timeout=120)
+                else:
+                    await asyncio.wait_for(
+                        client.start(bot_token=credentials.bot_token), timeout=30
                     )
-                except Exception as e:
-                    logger.error(f"Failed to download from {channel_id}: {e}")
-                    switch_triggered = False
 
-                if switch_triggered:
-                    logger.warning(
-                        f"Proxy switch triggered during '{channel_id}' — "
-                        f"will reconnect and resume"
-                    )
-                    monitor.reset()
-                    break  # exit channel loop; outer loop reconnects with next proxy
+                for channel_id in remaining:
+                    logger.info(f"--- Channel: {channel_id} ---")
+                    try:
+                        switch_triggered = await _download_with_watchdog(
+                            client, channel_id, count, work_dir, since, monitor, refresh_meta
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to download from {channel_id}: {e}")
+                        switch_triggered = False
 
-                completed_channels.add(channel_id)
+                    if switch_triggered:
+                        logger.warning(
+                            f"Proxy switch triggered during '{channel_id}' — "
+                            f"will reconnect and resume"
+                        )
+                        monitor.reset()
+                        break
 
-        except Exception as e:
-            logger.error(f"Client error on attempt {attempt + 1}: {e}")
-        finally:
-            await client.disconnect()
+                    completed_channels.add(channel_id)
 
-    monitor.detach()
-    logger.info(
-        f"Download finished. "
-        f"Completed {len(completed_channels)}/{len(channels)} channel(s)."
-    )
+            except Exception as e:
+                logger.error(f"Client error on attempt {attempt + 1}: {e}")
+            finally:
+                await client.disconnect()
+
+        monitor.detach()
+
+        # Check if all channels completed
+        if len(completed_channels) == len(channels):
+            logger.info(f"Download finished. Completed {len(completed_channels)}/{len(channels)} channel(s).")
+            return
+
+        # Not all channels completed — check if we should retry
+        if retry_count < max_retries:
+            retry_count += 1
+            logger.warning(
+                f"Only {len(completed_channels)}/{len(channels)} channels completed. "
+                f"Retry {retry_count}/{max_retries} after 30 minutes..."
+            )
+            await asyncio.sleep(retry_delay_sec)
+        else:
+            logger.error(
+                f"FATAL: Failed to download all channels after 20 hours. "
+                f"Only {len(completed_channels)}/{len(channels)} channels completed. Aborting."
+            )
+            exit(1)
 
 
 async def main() -> None:
